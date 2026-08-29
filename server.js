@@ -1,6 +1,7 @@
 'use strict';
 
 const http = require('http');
+const crypto = require('crypto');
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const UPSTREAM_HOST = process.env.DASHSCOPE_UPSTREAM_HOST || 'dashscope-intl.aliyuncs.com';
@@ -19,6 +20,13 @@ const INVALID_KEY_COOLDOWN_MS = parseInt(process.env.INVALID_KEY_COOLDOWN_MS || 
 // pasti pulih di waktu tsb -- pakai POST /admin/reset kalau sudah menambah saldo.
 const FREE_TIER_EXHAUSTED_COOLDOWN_MS = parseInt(process.env.FREE_TIER_EXHAUSTED_COOLDOWN_MS || String(30 * 24 * 60 * 60 * 1000), 10);
 const MODEL_ACCESS_DENIED_COOLDOWN_MS = parseInt(process.env.MODEL_ACCESS_DENIED_COOLDOWN_MS || String(24 * 60 * 60 * 1000), 10);
+// Batas total waktu rotasi per request. Tanpa ini, kalau upstream hang (bukan gagal cepat
+// seperti 401/429), proxy akan mencoba SEMUA key di pool satu-satu, masing-masing menunggu
+// sampai UPSTREAM_TIMEOUT_MS penuh -- dengan pool besar ini bisa jadi puluhan menit sebelum
+// klien akhirnya dapat balasan 503. Timeout attempt individual TIDAK dipotong (biar respons
+// lambat tapi valid tetap sempat selesai) -- yang dibatasi cuma jumlah waktu yang dihabiskan
+// pindah dari satu key ke key berikutnya.
+const REQUEST_MAX_DURATION_MS = parseInt(process.env.REQUEST_MAX_DURATION_MS || String(2 * UPSTREAM_TIMEOUT_MS), 10);
 
 function loadKeys() {
   const fromEnv = (process.env.DASHSCOPE_API_KEYS || '')
@@ -196,8 +204,13 @@ async function handleProxyRequest(req, res, bodyBuffer) {
   const model = extractModel(bodyBuffer);
   const attempts = pickKeysInOrder(model);
   const log = [];
+  const requestStarted = Date.now();
 
   for (const entry of attempts) {
+    if (Date.now() - requestStarted >= REQUEST_MAX_DURATION_MS) {
+      log.push(`berhenti rotasi -- batas waktu total request (${REQUEST_MAX_DURATION_MS}ms) tercapai, sisa key tidak dicoba`);
+      break;
+    }
     entry.totalRequests += 1;
     entry.lastUsedAt = new Date().toISOString();
     const started = Date.now();
@@ -294,7 +307,13 @@ function isAuthorized(req) {
   if (!PROXY_ACCESS_TOKEN) return true;
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
-  return token === PROXY_ACCESS_TOKEN;
+  // timingSafeEqual butuh panjang buffer yang sama -- perbandingan panjang di sini masih
+  // bocorin timing sedikit, tapi itu standar (lihat dok Node crypto) dan jauh lebih aman
+  // daripada "===" yang bocorin timing per-karakter yang cocok.
+  const tokenBuf = Buffer.from(token);
+  const expectedBuf = Buffer.from(PROXY_ACCESS_TOKEN);
+  if (tokenBuf.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(tokenBuf, expectedBuf);
 }
 
 function readBody(req) {

@@ -1,7 +1,9 @@
 # Catatan integrasi HomeLab-AI-Dental: network "ai-network" di bawah adalah
 # network eksternal yang sudah dibuat oleh project HomeLab-AI-Dental (docker-compose
-# di sana). Menyambung ke situ membuat container n8n tetap bisa memanggil proxy ini
-# lewat nama service "dashscope-proxy", persis seperti sebelum project ini dipisah.
+# di sana, dengan nama project "dental-ai-lab" -- makanya nama network aktualnya
+# "dental-ai-lab_ai-network", hasil auto-prefix Compose). Menyambung ke situ membuat
+# container n8n tetap bisa memanggil proxy ini lewat nama service "dashscope-proxy",
+# persis seperti sebelum project ini dipisah.
 # Kalau dipakai berdiri sendiri (tanpa HomeLab-AI-Dental), hapus bagian "networks"
 # di service dan di level top ini.
 services:
@@ -24,3 +26,4 @@ services:
 networks:
   ai-network:
     external: true
+    name: dental-ai-lab_ai-network

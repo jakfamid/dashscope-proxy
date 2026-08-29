@@ -4,7 +4,8 @@
   "description": "Reverse proxy dengan rotasi API key untuk DashScope compatible-mode (OpenAI-compatible), otomatis merotasi key saat rate limit/kuota trial gratis habis.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "start:native": "bash start.sh"
   },
   "license": "UNLICENSED",
   "private": true
