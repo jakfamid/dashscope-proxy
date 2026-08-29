@@ -1,0 +1,8 @@
+# Secret -- jangan pernah commit
+.env
+api-key.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+node_modules/

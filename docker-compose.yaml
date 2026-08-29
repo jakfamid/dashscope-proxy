@@ -1,0 +1,26 @@
+# Catatan integrasi HomeLab-AI-Dental: network "ai-network" di bawah adalah
+# network eksternal yang sudah dibuat oleh project HomeLab-AI-Dental (docker-compose
+# di sana). Menyambung ke situ membuat container n8n tetap bisa memanggil proxy ini
+# lewat nama service "dashscope-proxy", persis seperti sebelum project ini dipisah.
+# Kalau dipakai berdiri sendiri (tanpa HomeLab-AI-Dental), hapus bagian "networks"
+# di service dan di level top ini.
+services:
+  dashscope-proxy:
+    build: .
+    container_name: dashscope-proxy
+    ports:
+      - "8787:8787"
+    environment:
+      - PORT=8787
+      - DASHSCOPE_UPSTREAM_HOST=dashscope-intl.aliyuncs.com
+      - DASHSCOPE_API_KEYS_FILE=/run/secrets/api-key.txt
+      - PROXY_ACCESS_TOKEN=${DASHSCOPE_PROXY_TOKEN}
+    volumes:
+      - ./api-key.txt:/run/secrets/api-key.txt:ro
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+networks:
+  ai-network:
+    external: true

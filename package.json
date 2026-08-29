@@ -1,0 +1,11 @@
+{
+  "name": "dashscope-proxy",
+  "version": "1.0.0",
+  "description": "Reverse proxy dengan rotasi API key untuk DashScope compatible-mode (OpenAI-compatible), otomatis merotasi key saat rate limit/kuota trial gratis habis.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
