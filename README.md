@@ -128,6 +128,11 @@ Batas yang perlu diketahui sebelum memilih model:
   endpoint native `/api/v1/services/aigc/...`, embedding memakai
   `/compatible-mode/v1/embeddings`. Detail per kategori ada di MODELS.md.
 
+Proposal pengembangan interface sistem ini (admin API, dashboard web, CLI,
+plus rencana afinitas task async & WebSocket realtime) ada di
+**[INTERFACE.md](INTERFACE.md)** — reset selektif (§2.3–2.7) sudah
+diimplementasi; katalog model, dashboard, CLI, dan sisanya masih usulan.
+
 ## Variabel lingkungan
 
 | Variabel | Default | Keterangan |
