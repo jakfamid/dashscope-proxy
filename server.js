@@ -3,6 +3,7 @@
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 
@@ -39,6 +40,11 @@ const REQUEST_MAX_DURATION_MS = parseInt(process.env.REQUEST_MAX_DURATION_MS || 
 // supaya proses bisa dihentikan tanpa peduli cara start-nya (npm start, start.sh,
 // start.ps1, atau "node server.js" langsung).
 const PID_FILE = process.env.PID_FILE || '.dashscope-proxy.pid';
+const STARTED_AT = Date.now();
+// Untuk field `version` di GET /status (INTERFACE.md §2.7) -- dibaca sekali saat start;
+// gagal baca tidak kritis, cukup fallback ke nilai default.
+let VERSION = '0.0.0';
+try { VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || VERSION; } catch (e) { /* biarkan default */ }
 
 function loadKeys() {
   const fromEnv = (process.env.DASHSCOPE_API_KEYS || '')
@@ -313,6 +319,7 @@ async function handleProxyRequest(req, res, bodyBuffer) {
   res.end(JSON.stringify({
     error: {
       message: 'Semua API key DashScope di pool sedang cooldown/gagal untuk model ini. Cek GET /status untuk detail.',
+      code: 'pool_exhausted',
       model,
       attempts: log,
     },
@@ -341,6 +348,11 @@ function handleStatus(req, res) {
   res.end(JSON.stringify({
     totalKeys: keyPool.length,
     availableNow: keys.filter((k) => k.status === 'active').length,
+    // §2.7 INTERFACE.md: hitungan ringkas di level atas supaya operator (dan dashboard)
+    // tidak perlu memindai array `keys` satu-satu; struktur lama tidak berubah.
+    modelCooldownCount: keys.reduce((a, k) => a + k.modelCooldowns.length, 0),
+    uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000),
+    version: VERSION,
     keys,
   }, null, 2));
 }
@@ -353,6 +365,82 @@ function handleResetAll(req, res) {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true, message: 'Semua cooldown key (termasuk per-model) direset.' }));
+}
+
+function sendJson(res, status, obj) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(obj));
+}
+
+// Bentuk error admin mengikuti kontrak INTERFACE.md §1: { error: { message, code } }.
+function sendError(res, status, code, message) {
+  sendJson(res, status, { error: { message, code } });
+}
+
+// Baca + parse body JSON untuk endpoint admin. Mengembalikan {} kalau body kosong
+// (field wajib tetap divalidasi pemanggil), atau null kalau parse gagal -- dalam kasus
+// itu respons 400 sudah ditulis di sini dan pemanggil harus langsung return.
+async function readJsonBody(req, res) {
+  const buf = await readBody(req); // melempar {statusCode:413} kalau kebesaran -> ditangkap handler server
+  if (buf.length === 0) return {};
+  try {
+    return JSON.parse(buf.toString('utf8'));
+  } catch (e) {
+    sendError(res, 400, 'bad_request', 'Body bukan JSON yang valid.');
+    return null;
+  }
+}
+
+// Reset selektif (INTERFACE.md §2.3, P0-1) -- melengkapi POST /admin/reset yang global.
+// Reset per-model adalah operasi paling berharga: cooldown free_tier_exhausted 30 hari,
+// dan setelah isi saldo biasanya hanya sebagian model yang pulih.
+async function handleResetModel(req, res) {
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  if (typeof body.model !== 'string' || !body.model.trim() || body.model.trim().length > 200) {
+    sendError(res, 400, 'bad_request', 'Field "model" (string) wajib diisi.');
+    return;
+  }
+  const model = body.model.trim();
+  let cleared = 0;
+  for (const k of keyPool) {
+    if (k.modelCooldowns[model]) { delete k.modelCooldowns[model]; cleared += 1; }
+  }
+  if (cleared === 0) {
+    sendError(res, 404, 'not_found', `Tidak ada key yang sedang cooldown untuk model "${model}" -- tidak ada yang perlu direset.`);
+    return;
+  }
+  sendJson(res, 200, { ok: true, model, cleared, message: `Cooldown model "${model}" dihapus dari ${cleared} key.` });
+}
+
+async function handleResetKey(req, res) {
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  if (typeof body.key !== 'string' || !body.key.trim()) {
+    sendError(res, 400, 'bad_request', 'Field "key" (string) wajib diisi -- pakai bentuk masked dari GET /status.');
+    return;
+  }
+  const wanted = body.key.trim();
+  // Menerima bentuk masked (keluaran /status, alurnya: lihat -> salin -> reset) maupun
+  // key mentah kalau operator memang memegangnya; respons hanya menyebut masked.
+  const entry = keyPool.find((k) => k.masked === wanted || k.key === wanted);
+  if (!entry) {
+    sendError(res, 404, 'not_found', `Key "${wanted}" tidak ada di pool. Pakai bentuk masked dari GET /status.`);
+    return;
+  }
+  // Hanya membersihkan cooldown LEVEL KEY -- cooldown per-model key ini sengaja tidak
+  // disentuh (itu ranah /admin/reset/model), sesuai pembagian §2.3.
+  const wasCooling = entry.cooldownUntil > Date.now();
+  entry.cooldownUntil = 0;
+  entry.cooldownReason = null;
+  sendJson(res, 200, {
+    ok: true,
+    key: entry.masked,
+    cleared: wasCooling ? 1 : 0,
+    message: wasCooling
+      ? `Cooldown key ${entry.masked} dihapus (cooldown per-model, bila ada, tidak disentuh).`
+      : `Key ${entry.masked} memang tidak sedang cooldown level key.`,
+  });
 }
 
 function isAuthorized(req) {
@@ -410,6 +498,18 @@ const server = http.createServer(async (req, res) => {
     if (req.url === '/admin/reset' && req.method === 'POST') {
       if (!isAuthorized(req)) { res.writeHead(401).end('Unauthorized'); return; }
       handleResetAll(req, res);
+      return;
+    }
+
+    if (req.url === '/admin/reset/model' && req.method === 'POST') {
+      if (!isAuthorized(req)) { res.writeHead(401).end('Unauthorized'); return; }
+      await handleResetModel(req, res);
+      return;
+    }
+
+    if (req.url === '/admin/reset/key' && req.method === 'POST') {
+      if (!isAuthorized(req)) { res.writeHead(401).end('Unauthorized'); return; }
+      await handleResetKey(req, res);
       return;
     }
 

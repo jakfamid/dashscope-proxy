@@ -4,8 +4,9 @@
 // jadi tidak menghabiskan kuota). Jalankan: node test/proxy-integration.test.js
 // (artifak sementara -- pidfile & daftar key test -- ditulis ke logs/ yang di-gitignore)
 // Cover: autentikasi token, rotasi key + cooldown (key-level vs model-level), 503 saat
-// semua key mati, penerusan 4xx klien tanpa rotasi, streaming SSE, stripping header
-// gzip, batas ukuran body, /status, /admin/reset, dan penulisan PID file.
+// semua key mati (code pool_exhausted), penerusan 4xx klien tanpa rotasi, streaming SSE,
+// stripping header gzip, batas ukuran body, /status (termasuk field §2.7), /admin/reset
+// (global, per-model, per-key), dan penulisan PID file.
 
 const { spawn } = require('child_process');
 const http = require('http');
@@ -205,11 +206,14 @@ async function main() {
     check('kuota free-tier -> cooldown LEVEL MODEL (key tetap active)', bySuffix('0005').status === 'active' && bySuffix('0005').modelCooldowns.some((m) => m.model === 'm-good'), JSON.stringify(bySuffix('0005')));
     check('AccessDenied -> cooldown model 24 jam untuk key tsb', bySuffix('0006').modelCooldowns.some((m) => m.model === 'm-good' && /model tidak diaktifkan/.test(m.reason)), JSON.stringify(bySuffix('0006')));
     check('key yang belum pernah sukses tetap tercatat statistiknya', st.keys.every((k) => k.totalRequests >= 1));
+    check('GET /status memuat modelCooldownCount, uptimeSec, version (INTERFACE.md §2.7)',
+      typeof st.modelCooldownCount === 'number' && st.modelCooldownCount > 0 && typeof st.uptimeSec === 'number' && !!st.version,
+      JSON.stringify({ m: st.modelCooldownCount, u: st.uptimeSec, v: st.version }));
 
     // --- semua key mati -> 503 + daftar percobaan ---
     r = await request(CHAT, { method: 'POST', body: { model: 'm-empty-pool', messages: [] } });
     j = await r.json().catch(() => ({}));
-    check('semua key gagal -> 503 dengan attempts per key', r.status === 503 && Array.isArray(j.error.attempts) && j.error.attempts.length === KEYS.length, `status=${r.status} attempts=${j.error && j.error.attempts && j.error.attempts.length}`);
+    check('semua key gagal -> 503 + code pool_exhausted + attempts per key', r.status === 503 && j.error.code === 'pool_exhausted' && Array.isArray(j.error.attempts) && j.error.attempts.length === KEYS.length, `status=${r.status} code=${j.error && j.error.code} attempts=${j.error && j.error.attempts && j.error.attempts.length}`);
 
     // --- error klien (400) diteruskan apa adanya, TANPA rotasi ---
     const before = await (await request('/status')).json();
@@ -260,6 +264,41 @@ async function main() {
     r = await request('/compatible-mode/v1/models');
     j = await r.json().catch(() => ({}));
     check('GET /models diteruskan ke upstream', r.status === 200 && j.data && j.data[0].id === 'qwen-mock', `status=${r.status}`);
+
+    // --- P0-1: reset selektif per-model / per-key (INTERFACE.md §2.3) ---
+    // State saat ini: key 0002 cooldown LEVEL KEY (401); beberapa key punya cooldown
+    // LEVEL MODEL untuk m-good (429 free-tier, 429 rate, 403 AccessDenied).
+    r = await request('/admin/reset/model', { method: 'POST', token: null, body: { model: 'm-good' } });
+    check('POST /admin/reset/model tanpa token -> 401', r.status === 401, `status=${r.status}`);
+    r = await request('/admin/reset/model', { method: 'POST', body: { bukan: 'field-model' } });
+    j = await r.json().catch(() => ({}));
+    check('POST /admin/reset/model tanpa field model -> 400 bad_request', r.status === 400 && j.error.code === 'bad_request', `status=${r.status}`);
+    r = await request('/admin/reset/model', { method: 'POST', body: 'ini-bukan-json' });
+    j = await r.json().catch(() => ({}));
+    check('POST /admin/reset/model body bukan JSON -> 400 bad_request', r.status === 400 && j.error.code === 'bad_request', `status=${r.status}`);
+    r = await request('/admin/reset/model', { method: 'POST', body: { model: 'tidak-pernah-cooldown' } });
+    j = await r.json().catch(() => ({}));
+    check('POST /admin/reset/model tanpa cooldown apa pun -> 404 not_found', r.status === 404 && j.error.code === 'not_found', `status=${r.status}`);
+
+    r = await request('/admin/reset/model', { method: 'POST', body: { model: 'm-good' } });
+    j = await r.json().catch(() => ({}));
+    st = await (await request('/status')).json();
+    check('POST /admin/reset/model menghapus model tsb dari semua key',
+      r.status === 200 && j.ok === true && j.cleared >= 2 && st.keys.every((k) => !k.modelCooldowns.some((m) => m.model === 'm-good')),
+      JSON.stringify({ ok: j.ok, cleared: j.cleared }));
+    check('reset per-model tidak menyentuh cooldown level key (key 401 tetap cooldown)',
+      bySuffix('0002').status === 'cooldown', JSON.stringify(bySuffix('0002').status));
+
+    r = await request('/admin/reset/key', { method: 'POST', body: { key: 'sk-tidak...pool' } });
+    j = await r.json().catch(() => ({}));
+    check('POST /admin/reset/key key tidak dikenal -> 404 not_found', r.status === 404 && j.error.code === 'not_found', `status=${r.status}`);
+    const masked0002 = bySuffix('0002').key; // bentuk masked persis keluaran /status
+    r = await request('/admin/reset/key', { method: 'POST', body: { key: masked0002 } });
+    j = await r.json().catch(() => ({}));
+    st = await (await request('/status')).json();
+    check('POST /admin/reset/key dengan masked menghapus cooldown level key tsb',
+      r.status === 200 && j.ok === true && j.cleared === 1 && bySuffix('0002').status === 'active',
+      JSON.stringify(j));
 
     // --- /admin/reset ---
     r = await request('/admin/reset', { method: 'POST', token: null });
