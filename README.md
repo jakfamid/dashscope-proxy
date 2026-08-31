@@ -130,8 +130,8 @@ Batas yang perlu diketahui sebelum memilih model:
 
 Proposal pengembangan interface sistem ini (admin API, dashboard web, CLI,
 plus rencana afinitas task async & WebSocket realtime) ada di
-**[INTERFACE.md](INTERFACE.md)** — reset selektif (§2.3–2.7) sudah
-diimplementasi; katalog model, dashboard, CLI, dan sisanya masih usulan.
+**[INTERFACE.md](INTERFACE.md)** — katalog model (§2.1–2.2) & reset selektif
+(§2.3–2.7) sudah diimplementasi; dashboard & CLI masih usulan.
 
 ## Variabel lingkungan
 

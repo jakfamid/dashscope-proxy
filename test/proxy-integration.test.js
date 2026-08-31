@@ -5,8 +5,9 @@
 // (artifak sementara -- pidfile & daftar key test -- ditulis ke logs/ yang di-gitignore)
 // Cover: autentikasi token, rotasi key + cooldown (key-level vs model-level), 503 saat
 // semua key mati (code pool_exhausted), penerusan 4xx klien tanpa rotasi, streaming SSE,
-// stripping header gzip, batas ukuran body, /status (termasuk field §2.7), /admin/reset
-// (global, per-model, per-key), dan penulisan PID file.
+// stripping header gzip, batas ukuran body, /status (termasuk field §2.7), katalog model
+// GET /admin/models + /admin/models/{id} (P0-2), /admin/reset (global, per-model,
+// per-key), dan penulisan PID file.
 
 const { spawn } = require('child_process');
 const http = require('http');
@@ -83,7 +84,11 @@ const mock = http.createServer((req, res) => {
 
     if (req.method === 'GET') {
       if (fail) return send(fail.status, fail.body);
-      return send(200, { object: 'list', data: [{ id: 'qwen-mock', object: 'model' }] });
+      // Daftar model untuk tes katalog admin (P0-2): campuran id supaya semua status
+      // (ok/partial/exhausted/special) teruji. qwen-mock TETAP PERTAMA karena tes lama
+      // 'GET /models diteruskan' mengecek data[0].id === 'qwen-mock'.
+      const ids = ['qwen-mock', 'm-good', 'm-empty-pool', 'qwen3-tts-flash-realtime', 'zzz-uncurated', 'kimi/kimi-k3'];
+      return send(200, { object: 'list', data: ids.map((id) => ({ id, object: 'model' })) });
     }
     if (model === 'm-gzip') return send(200, chatBody('halo dari mock gzip'), true);
     if (fail) return send(fail.status, fail.body);
@@ -264,6 +269,62 @@ async function main() {
     r = await request('/compatible-mode/v1/models');
     j = await r.json().catch(() => ({}));
     check('GET /models diteruskan ke upstream', r.status === 200 && j.data && j.data[0].id === 'qwen-mock', `status=${r.status}`);
+
+    // --- P0-2: katalog model hidup (INTERFACE.md §2.1-2.2) ---
+    // State saat ini: m-good partial (cooldown model di key 0004/0005/0006),
+    // m-empty-pool exhausted (SEMUA key kena cooldown model), qwen3-tts-flash-realtime
+    // WebSocket-only (selalu 'special'), zzz-uncurated tidak ada di kurasi katalog.
+    r = await request('/admin/models', { token: null });
+    check('GET /admin/models tanpa token -> 401', r.status === 401, `status=${r.status}`);
+    r = await request('/admin/models');
+    j = await r.json().catch(() => ({}));
+    const row = (id) => (j.models || []).find((m) => m.id === id) || {};
+    check('GET /admin/models: daftar upstream + metadata katalog + summary',
+      r.status === 200 && j.totalModels === 6 && j.source === 'live' && typeof j.asOf === 'string'
+        && j.summary.ok === 3 && j.summary.partial === 1 && j.summary.exhausted === 1 && j.summary.special === 1,
+      JSON.stringify({ total: j.totalModels, summary: j.summary, source: j.source }));
+    check('katalog: m-good partial dengan blockedReasons terisi',
+      row('m-good').status === 'partial' && row('m-good').keysBlocked === 3 && row('m-good').blockedReasons.length >= 2,
+      JSON.stringify(row('m-good')));
+    check('katalog: m-empty-pool exhausted (semua key kena cooldown)',
+      row('m-empty-pool').status === 'exhausted' && row('m-empty-pool').keysBlocked === KEYS.length,
+      JSON.stringify({ s: row('m-empty-pool').status, b: row('m-empty-pool').keysBlocked }));
+    check('katalog: model realtime WebSocket-only selalu status special',
+      row('qwen3-tts-flash-realtime').status === 'special' && row('qwen3-tts-flash-realtime').transport === 'websocket' && row('qwen3-tts-flash-realtime').category === 'realtime',
+      JSON.stringify(row('qwen3-tts-flash-realtime')));
+    check('katalog: id tak terkurasi tetap tampil dengan category unknown',
+      row('zzz-uncurated').category === 'unknown' && row('zzz-uncurated').status === 'ok',
+      JSON.stringify(row('zzz-uncurated')));
+    r = await request('/admin/models?category=realtime');
+    j = await r.json().catch(() => ({}));
+    check('filter category bekerja', r.status === 200 && j.filtered === 1 && j.models[0].id === 'qwen3-tts-flash-realtime',
+      JSON.stringify(j.models && j.models.map((m) => m.id)));
+    r = await request('/admin/models?q=empty&status=exhausted,partial');
+    j = await r.json().catch(() => ({}));
+    check('filter q + status (CSV) bekerja', r.status === 200 && j.filtered === 1 && j.models[0].id === 'm-empty-pool',
+      JSON.stringify(j.models && j.models.map((m) => m.id)));
+    r = await request('/admin/models?q=zzz-tidak-ada');
+    j = await r.json().catch(() => ({}));
+    check('filter tanpa hasil -> models kosong, totalModels tetap utuh',
+      r.status === 200 && j.filtered === 0 && j.models.length === 0 && j.totalModels === 6, JSON.stringify({ filtered: j.filtered }));
+
+    r = await request('/admin/models/m-good');
+    j = await r.json().catch(() => ({}));
+    check('GET /admin/models/{id}: verdict partial + reasonBreakdown + sample',
+      r.status === 200 && j.id === 'm-good' && j.verdict === 'partial' && j.keysBlocked === 3
+        && Object.keys(j.reasonBreakdown).length >= 2 && j.sample.length === 3,
+      JSON.stringify({ v: j.verdict, rb: j.reasonBreakdown }));
+    r = await request('/admin/models/' + encodeURIComponent('kimi/kimi-k3'));
+    j = await r.json().catch(() => ({}));
+    check('id mengandung "/" (percent-encoded) tetap terjawab',
+      r.status === 200 && j.id === 'kimi/kimi-k3' && j.category === 'third-party', JSON.stringify({ id: j.id, c: j.category }));
+    r = await request('/admin/models/qwen3-rerank');
+    j = await r.json().catch(() => ({}));
+    check('model terkurasi tapi tak ada di daftar upstream tetap dikenal (rerank)',
+      r.status === 200 && j.category === 'rerank' && j.verdict === 'ok', JSON.stringify({ c: j.category }));
+    r = await request('/admin/models/model-tidak-dikenal-xyz');
+    j = await r.json().catch(() => ({}));
+    check('GET /admin/models/{id} tak dikenal -> 404 not_found', r.status === 404 && j.error.code === 'not_found', `status=${r.status}`);
 
     // --- P0-1: reset selektif per-model / per-key (INTERFACE.md §2.3) ---
     // State saat ini: key 0002 cooldown LEVEL KEY (401); beberapa key punya cooldown

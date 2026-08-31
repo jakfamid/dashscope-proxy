@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
+const catalog = require('./lib/model-catalog');
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const UPSTREAM_HOST = process.env.DASHSCOPE_UPSTREAM_HOST || 'dashscope-intl.aliyuncs.com';
@@ -443,6 +444,154 @@ async function handleResetKey(req, res) {
   });
 }
 
+// ---------------- P0-2: katalog model hidup (INTERFACE.md §2.1-2.2) ----------------
+
+// Cache daftar id model dari upstream dengan TTL -- hindari memukul DashScope setiap
+// kali admin membuka katalog. Sumber: GET {upstream}/compatible-mode/v1/models
+// (request paling ringan; tidak kena throttle kuota -- diverifikasi saat survei katalog).
+const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+let modelsCache = { fetchedAt: 0, ids: [], source: 'none', error: null };
+
+async function fetchUpstreamModelIds() {
+  // Pakai key pertama yang tidak sedang cooldown key-level; kalau semua dingin, pakai
+  // key pertama saja (GET /models ringan, kemungkinan besar tetap lolos).
+  const now = Date.now();
+  const entry = keyPool.find((k) => k.cooldownUntil <= now) || keyPool[0];
+  if (!entry) return [];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const resp = await fetch(`${UPSTREAM_ORIGIN}/compatible-mode/v1/models`, {
+      headers: { Authorization: `Bearer ${entry.key}` },
+      signal: controller.signal,
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} dari upstream /models`);
+    const j = await resp.json();
+    const ids = (j.data || []).map((m) => m && m.id).filter((x) => typeof x === 'string' && x);
+    if (!ids.length) throw new Error('upstream /models membalas tanpa data');
+    return ids;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getModelIds() {
+  const fresh = Date.now() - modelsCache.fetchedAt < MODELS_CACHE_TTL_MS && modelsCache.ids.length;
+  if (fresh) return modelsCache;
+  try {
+    const ids = await fetchUpstreamModelIds();
+    modelsCache = { fetchedAt: Date.now(), ids, source: 'live', error: null };
+  } catch (e) {
+    // Gagal ambil: pertahankan cache lama (lebih baik daripada daftar kosong) dan
+    // tandai sumbernya supaya operator tahu datanya basi/gagal.
+    modelsCache = {
+      fetchedAt: modelsCache.fetchedAt,
+      ids: modelsCache.ids,
+      source: modelsCache.ids.length ? 'stale' : 'error',
+      error: e.message,
+    };
+  }
+  return modelsCache;
+}
+
+function blockedInfoFor(modelId, now) {
+  const blocked = keyPool.filter(
+    (k) => k.modelCooldowns[modelId] && k.modelCooldowns[modelId].until > now
+  );
+  const reasons = [...new Set(blocked.map((k) => k.modelCooldowns[modelId].reason))];
+  return { blocked, reasons };
+}
+
+async function handleAdminModels(req, res, query) {
+  const cache = await getModelIds();
+  const now = Date.now();
+
+  const rows = cache.ids.map((id) => {
+    const meta = catalog.classify(id);
+    const { blocked, reasons } = blockedInfoFor(id, now);
+    return {
+      id,
+      category: meta.category,
+      transport: meta.transport,
+      status: catalog.statusFor(id, blocked.length, keyPool.length),
+      keysBlocked: blocked.length,
+      keysTotal: keyPool.length,
+      blockedReasons: reasons,
+      recommended: catalog.taskLabelFor(id),
+      notes: meta.notes,
+    };
+  });
+
+  // Filter opsional: category (eksak), q (substring id), status (CSV), recommended (bool).
+  const q = (query.q || '').toLowerCase();
+  const category = query.category || '';
+  const statusFilter = (query.status || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const recommendedOnly = query.recommended === 'true' || query.recommended === '1';
+
+  const filtered = rows.filter((row) => {
+    if (category && row.category !== category) return false;
+    if (q && !row.id.toLowerCase().includes(q)) return false;
+    if (statusFilter.length && !statusFilter.includes(row.status)) return false;
+    if (recommendedOnly && !row.recommended) return false;
+    return true;
+  });
+
+  const summary = { ok: 0, partial: 0, exhausted: 0, special: 0 };
+  for (const row of rows) {
+    if (summary[row.status] !== undefined) summary[row.status] += 1;
+  }
+
+  sendJson(res, 200, {
+    asOf: new Date(cache.fetchedAt || Date.now()).toISOString(),
+    source: cache.source,
+    upstreamError: cache.error,
+    totalModels: rows.length,
+    filtered: filtered.length,
+    summary,
+    models: filtered,
+  });
+}
+
+async function handleAdminModelDetail(req, res, modelId) {
+  const cache = await getModelIds();
+  const now = Date.now();
+  const meta = catalog.classify(modelId);
+  // "Dikenal" = ada di daftar upstream ATAU terkurasi di katalog (mis. rerank yang tidak
+  // muncul di /models tapi terkurasi di MODELS.md §10).
+  const known = cache.ids.includes(modelId) || meta.category !== 'unknown';
+  if (!known) {
+    sendError(res, 404, 'not_found',
+      `Model "${modelId}" tidak dikenal: tidak ada di daftar upstream dan tidak ada di kurasi katalog.`);
+    return;
+  }
+
+  const blocked = keyPool.filter(
+    (k) => k.modelCooldowns[modelId] && k.modelCooldowns[modelId].until > now
+  );
+  const reasonBreakdown = {};
+  for (const k of blocked) {
+    const reason = k.modelCooldowns[modelId].reason;
+    reasonBreakdown[reason] = (reasonBreakdown[reason] || 0) + 1;
+  }
+
+  sendJson(res, 200, {
+    id: modelId,
+    verdict: catalog.statusFor(modelId, blocked.length, keyPool.length),
+    category: meta.category,
+    transport: meta.transport,
+    recommended: catalog.taskLabelFor(modelId),
+    notes: meta.notes,
+    keysTotal: keyPool.length,
+    keysBlocked: blocked.length,
+    reasonBreakdown,
+    sample: blocked.slice(0, 5).map((k) => ({
+      key: k.masked,
+      reason: k.modelCooldowns[modelId].reason,
+      cooldownUntil: new Date(k.modelCooldowns[modelId].until).toISOString(),
+    })),
+  });
+}
+
 function isAuthorized(req) {
   if (!PROXY_ACCESS_TOKEN) return true;
   const auth = req.headers['authorization'] || '';
@@ -510,6 +659,34 @@ const server = http.createServer(async (req, res) => {
     if (req.url === '/admin/reset/key' && req.method === 'POST') {
       if (!isAuthorized(req)) { res.writeHead(401).end('Unauthorized'); return; }
       await handleResetKey(req, res);
+      return;
+    }
+
+    // ---- P0-2: katalog model (INTERFACE.md §2.1-2.2) ----
+    // Pathname & query dipisah di sini karena rute model butuh query string
+    // (?category=...&q=...) dan id di path; rute lama di atas membandingkan string penuh.
+    const qIdx = req.url.indexOf('?');
+    const pathname = qIdx === -1 ? req.url : req.url.slice(0, qIdx);
+    const query = qIdx === -1 ? {} : Object.fromEntries(new URLSearchParams(req.url.slice(qIdx + 1)));
+
+    if (pathname === '/admin/models' && req.method === 'GET') {
+      if (!isAuthorized(req)) { res.writeHead(401).end('Unauthorized'); return; }
+      await handleAdminModels(req, res, query);
+      return;
+    }
+
+    if (pathname.startsWith('/admin/models/') && req.method === 'GET') {
+      if (!isAuthorized(req)) { res.writeHead(401).end('Unauthorized'); return; }
+      let modelId;
+      try {
+        // decode supaya id ber-%2F (mis. "kimi/kimi-k3", "ZHIPU/GLM-5.3") tetap utuh.
+        modelId = decodeURIComponent(pathname.slice('/admin/models/'.length));
+      } catch {
+        sendError(res, 400, 'bad_request', 'Pengkodean URL model id tidak valid.');
+        return;
+      }
+      if (!modelId) { sendError(res, 404, 'not_found', 'Path tidak dikenal.'); return; }
+      await handleAdminModelDetail(req, res, modelId);
       return;
     }
 
