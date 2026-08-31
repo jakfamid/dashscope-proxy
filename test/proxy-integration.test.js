@@ -9,7 +9,7 @@
 // GET /admin/models + /admin/models/{id} (P0-2), /admin/reset (global, per-model,
 // per-key), dan penulisan PID file.
 
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const http = require('http');
 const zlib = require('zlib');
 const fs = require('fs');
@@ -326,6 +326,29 @@ async function main() {
     j = await r.json().catch(() => ({}));
     check('GET /admin/models/{id} tak dikenal -> 404 not_found', r.status === 404 && j.error.code === 'not_found', `status=${r.status}`);
 
+    // --- P0-2 lanjut: CLI bin/dsp.js (INTERFACE.md §4) ---
+    const DSP = path.join(ROOT, 'bin', 'dsp.js');
+    const dsp = (...args) => spawnSync(process.execPath, [DSP, ...args, '--base-url', BASE, '--token', TOKEN], { encoding: 'utf8' });
+    let c = dsp('models');
+    check('CLI models: tabel katalog + status baris, exit 0',
+      c.status === 0 && /ID\s+KATEGORI/.test(c.stdout) && c.stdout.includes('qwen3-tts-flash-realtime') && /partial/.test(c.stdout),
+      (c.stdout + c.stderr).slice(0, 400));
+    c = dsp('models', '--category', 'realtime');
+    check('CLI models --category memfilter', c.status === 0 && c.stdout.includes('qwen3-tts-flash-realtime') && !c.stdout.includes('m-empty-pool'), c.stdout.slice(0, 300));
+    c = dsp('models', 'm-good');
+    check('CLI models <id>: detail partial + alasan cooldown',
+      c.status === 0 && /verdict: partial/.test(c.stdout) && /3\/6/.test(c.stdout) && /Alasan cooldown/.test(c.stdout), c.stdout.slice(0, 400));
+    c = dsp('models', 'model-tidak-dikenal-xyz');
+    check('CLI models <id> tak dikenal -> exit 1', c.status === 1 && /tidak dikenal/.test(c.stderr), c.stderr.slice(0, 200));
+    c = dsp('status');
+    check('CLI status: ringkasan pool + key bermasalah', c.status === 0 && /key siap/.test(c.stdout) && /0002/.test(c.stdout), c.stdout.slice(0, 300));
+    c = dsp('recommend');
+    check('CLI recommend: kurasi katalog + status live', c.status === 0 && /chat-cepat/.test(c.stdout) && /tdk di daftar/.test(c.stdout), c.stdout.slice(0, 300));
+    c = dsp();
+    check('CLI tanpa argumen -> usage + exit 2', c.status === 2 && /Pemakaian/.test(c.stdout + c.stderr), `exit=${c.status}`);
+    c = dsp('help');
+    check('CLI help -> usage + exit 0', c.status === 0 && /Pemakaian/.test(c.stdout), `exit=${c.status}`);
+
     // --- P0-1: reset selektif per-model / per-key (INTERFACE.md §2.3) ---
     // State saat ini: key 0002 cooldown LEVEL KEY (401); beberapa key punya cooldown
     // LEVEL MODEL untuk m-good (429 free-tier, 429 rate, 403 AccessDenied).
@@ -370,6 +393,20 @@ async function main() {
     st = await (await request('/status')).json();
     check('setelah reset: semua cooldown (key & model) bersih',
       st.availableNow === st.totalKeys && st.keys.every((k) => k.modelCooldowns.length === 0), JSON.stringify({ avail: st.availableNow, total: st.totalKeys }));
+
+    // --- P0-3: CLI mutasi & path admin tak dikenal (INTERFACE.md §4) ---
+    let c2 = dsp('reset');
+    check('CLI reset global (pool sudah bersih) -> exit 0', c2.status === 0 && /cooldown/i.test(c2.stdout), (c2.stdout + c2.stderr).slice(0, 200));
+    c2 = dsp('reset', '--model', 'm-good');
+    check('CLI reset --model tanpa cooldown -> exit 1 + pesan 404', c2.status === 1 && /404/.test(c2.stderr), c2.stderr.slice(0, 200));
+    c2 = dsp('keys', 'reload');
+    check('CLI keys reload -> pesan endpoint P1 belum tersedia + exit 1', c2.status === 1 && /belum tersedia/i.test(c2.stderr), c2.stderr.slice(0, 200));
+    c2 = dsp('probe', 'm-good', '--keys', '2');
+    check('CLI probe -> pesan endpoint P1 belum tersedia + exit 1', c2.status === 1 && /belum tersedia/i.test(c2.stderr), c2.stderr.slice(0, 200));
+    c2 = dsp('probe');
+    check('CLI probe tanpa model -> exit 2', c2.status === 2, `exit=${c2.status}`);
+    r = await request('/admin/tidak-ada', { token: null });
+    check('path /admin/* tak dikenal -> 404 (bukan pass-through)', r.status === 404, `status=${r.status}`);
 
     // --- pidfile ---
     check('PID file ditulis begitu server listen',

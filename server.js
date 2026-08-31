@@ -690,6 +690,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Namespace /admin/* khusus admin API: path tak dikenal di dalamnya TIDAK boleh
+    // jatuh ke pass-through upstream — bisa memicu request tak disengaja ke DashScope
+    // dan membingungkan operator. Mis. POST /admin/probe sebelum P1 ada -> 404 jelas.
+    if (pathname === '/admin' || pathname.startsWith('/admin/')) {
+      sendError(res, 404, 'not_found', `Path admin tidak dikenal: ${pathname} (metode ${req.method}).`);
+      return;
+    }
+
     if (!isAuthorized(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'Unauthorized -- token proxy tidak cocok.' } }));

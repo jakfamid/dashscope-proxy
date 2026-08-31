@@ -1,8 +1,9 @@
 # Proposal interface untuk dashscope-proxy
 
 Status: **implementasi bertahap** — §2.1–2.7 (katalog model + reset selektif
-per-model/per-key + field `/status`) sudah diimplementasi (P0-1 & P0-2);
-dashboard, CLI, dan sisanya masih proposal. Dibuat berdasar pembacaan `server.js`
+per-model/per-key + field `/status`) & §4 CLI sudah diimplementasi (P0-1 s.d.
+P0-3); dashboard, probe/metrics, dan sisanya masih proposal. Dibuat berdasar
+pembacaan `server.js`
 dan hasil survei `MODELS.md` per 31-08-2026. Tujuan: menjadikan proxy ini bisa
 dioperasikan, dipantau, dan dipilih modelnya lewat interface yang konsisten —
 bukan cuma lewat curl manual ke endpoint wildcard.
