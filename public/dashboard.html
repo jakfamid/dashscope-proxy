@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dashscope-proxy — dashboard</title>
+<style>
+  :root { --bg:#10141a; --panel:#181f28; --line:#2a3542; --fg:#dbe4ee; --dim:#8496a8;
+          --ok:#3fb96f; --warn:#d9a441; --bad:#d45d5d; --accent:#4d9fff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 system-ui, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+           background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; }
+  header .sp { flex: 1; }
+  #tokstat { color: var(--dim); font-size: 12px; }
+  nav { display: flex; gap: 4px; padding: 8px 16px 0; }
+  nav button { background: none; border: 1px solid var(--line); border-bottom: none;
+               color: var(--dim); padding: 7px 16px; border-radius: 8px 8px 0 0;
+               cursor: pointer; font: inherit; }
+  nav button.on { background: var(--panel); color: var(--fg); }
+  main { padding: 16px; }
+  section.tab { display: none; }
+  section.tab.on { display: block; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 14px 16px; margin-bottom: 14px; }
+  .big { display: flex; gap: 24px; flex-wrap: wrap; }
+  .big .num { font-size: 30px; font-weight: 600; }
+  .big .lbl { color: var(--dim); font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { color: var(--dim); font-weight: 500; }
+  tr.click { cursor: pointer; }
+  tr.click:hover td { background: #1c2530; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .b-ok { background: #12351f; color: var(--ok); }
+  .b-warn { background: #3a2f14; color: var(--warn); }
+  .b-bad { background: #3a1919; color: var(--bad); }
+  .b-dim { background: #232c36; color: var(--dim); }
+  .chip { display: inline-block; padding: 0 8px; border-radius: 10px; font-size: 12px;
+          background: #232c36; color: var(--dim); margin-right: 4px; }
+  button.act { background: #223041; color: var(--fg); border: 1px solid var(--line);
+               border-radius: 6px; padding: 5px 12px; cursor: pointer; font: inherit; }
+  button.act:hover { border-color: var(--accent); }
+  button.act.danger { background: #3a2020; }
+  input, select, textarea { background: #10151c; color: var(--fg); border: 1px solid var(--line);
+               border-radius: 6px; padding: 6px 10px; font: inherit; }
+  textarea { width: 100%; min-height: 110px; font-family: ui-monospace, monospace; }
+  .bar { height: 10px; border-radius: 5px; background: #232c36; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--ok); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  #login { max-width: 420px; margin: 60px auto; }
+  .muted { color: var(--dim); font-size: 12px; }
+  code { background: #10151c; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  #toast { position: fixed; bottom: 18px; right: 18px; background: var(--panel);
+           border: 1px solid var(--accent); padding: 10px 16px; border-radius: 8px;
+           display: none; z-index: 9; }
+</style>
+</head>
+<body>
+<div id="login" class="panel" style="display:none">
+  <h2 style="margin-top:0">Masuk ke dashboard</h2>
+  <p class="muted">Halaman ini publik, tetapi semua data diambil dari endpoint admin
+  dengan token proxy. Token hanya disimpan di <code>sessionStorage</code> browser ini
+  dan dikirim sebagai <code>Authorization: Bearer</code>.</p>
+  <div class="row">
+    <input id="tokenInput" type="password" placeholder="PROXY_ACCESS_TOKEN" style="flex:1">
+    <button class="act" id="loginBtn">Masuk</button>
+  </div>
+  <p class="muted" id="loginErr" style="color:var(--bad)"></p>
+</div>
+
+<div id="app" style="display:none">
+  <header>
+    <h1>dashscope-proxy</h1>
+    <span id="ver" class="muted"></span>
+    <span class="sp"></span>
+    <span id="tokstat"></span>
+    <button class="act" id="logoutBtn">Ganti token</button>
+  </header>
+  <nav>
+    <button data-tab="ringkasan" class="on">Ringkasan</button>
+    <button data-tab="keys">Keys</button>
+    <button data-tab="models">Models</button>
+    <button data-tab="probe">Probe</button>
+  </nav>
+  <main>
+    <section class="tab on" id="tab-ringkasan">
+      <div class="panel"><div class="big" id="bigstats"></div></div>
+      <div class="panel">
+        <div class="row"><b>Kesehatan pool</b><span id="healthlabel" class="muted"></span></div>
+        <div class="bar"><div id="healthbar" style="width:0%"></div></div>
+        <div class="row" style="margin-top:12px">
+          <button class="act danger" id="resetAllBtn">Reset semua cooldown</button>
+          <button class="act" id="reloadKeysBtn">Muat ulang key</button>
+          <span class="muted" id="actionMsg"></span>
+        </div>
+      </div>
+    </section>
+    <section class="tab" id="tab-keys">
+      <div class="panel">
+        <div class="row">
+          <b>Keys</b>
+          <select id="keyFilter">
+            <option value="">semua</option>
+            <option value="active">active</option>
+            <option value="cooldown">cooldown</option>
+          </select>
+        </div>
+        <table><thead><tr>
+          <th>Key</th><th>Status</th><th>Pulih</th><th>Alasan</th>
+          <th>Req</th><th>Gagal</th><th>Error terakhir</th><th></th>
+        </tr></thead><tbody id="keysBody"></tbody></table>
+      </div>
+    </section>
+    <section class="tab" id="tab-models">
+      <div class="panel">
+        <div class="row">
+          <b>Katalog model</b>
+          <input id="mSearch" placeholder="cari id…" style="width:220px">
+          <select id="mCategory"><option value="">semua kategori</option></select>
+          <select id="mStatus">
+            <option value="">semua status</option>
+            <option value="ok">ok</option><option value="partial">partial</option>
+            <option value="exhausted">exhausted</option><option value="special">special</option>
+          </select>
+          <span class="muted" id="mInfo"></span>
+        </div>
+        <table><thead><tr>
+          <th>ID</th><th>Kategori</th><th>Transport</th><th>Status</th>
+          <th>Blokir</th><th>Rekomendasi</th><th></th>
+        </tr></thead><tbody id="modelsBody"></tbody></table>
+      </div>
+      <div class="panel" id="modelDetail" style="display:none"></div>
+    </section>
+    <section class="tab" id="tab-probe">
+      <div class="panel">
+        <p class="muted">Probe kuota lewat instance proxy sementara dengan subset key
+        (INTERFACE.md §2.6) — cooldown produksi tidak tercemar.</p>
+        <div class="row">
+          <label>Jumlah key sample <input id="probeKeys" type="number" value="3" min="1" style="width:70px"></label>
+          <button class="act" id="probeRun">Jalankan probe</button>
+          <span class="muted" id="probeMsg"></span>
+        </div>
+        <div class="row"><textarea id="probeModels" placeholder="satu model per baris&#10;qwen-plus&#10;text-embedding-v4"></textarea></div>
+        <table><thead><tr>
+          <th>Model</th><th>Hidup</th><th>Status</th><th>Key hidup</th>
+          <th>Percobaan</th><th>Waktu</th><th>Catatan</th>
+        </tr></thead><tbody id="probeBody"></tbody></table>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toast"></div>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+let token = sessionStorage.getItem('dsp_token') || '';
+
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(toast._t); toast._t = setTimeout(() => { t.style.display = 'none'; }, 3500);
+}
+
+async function api(pathname, opts = {}) {
+  const headers = opts.headers || {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+  const r = await fetch(pathname, { method: opts.method || 'GET', headers,
+    body: opts.body === undefined ? undefined : JSON.stringify(opts.body) });
+  let j = null; try { j = await r.clone().json(); } catch (e) { /* bukan JSON */ }
+  if (r.status === 401) showLogin('Token ditolak server (401).');
+  return { status: r.status, json: j };
+}
+
+function fmtIn(ms) {
+  if (!ms || ms <= 0) return '-';
+  const m = Math.max(1, Math.round(ms / 60000));
+  if (m < 60) return `±${m} menit`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `±${h} jam`;
+  return `±${Math.round(h / 24)} hari`;
+}
+const badge = (txt, cls) => `<span class="badge ${cls}">${esc(txt)}</span>`;
+const statusBadge = (s) => badge(s, s === 'ok' ? 'b-ok' : s === 'partial' ? 'b-warn' : s === 'exhausted' ? 'b-bad' : 'b-dim');
+
+function showLogin(err) {
+  $('app').style.display = 'none'; $('login').style.display = 'block';
+  if (err) $('loginErr').textContent = err;
+}
+function showApp() { $('login').style.display = 'none'; $('app').style.display = 'block'; }
+
+async function tryLogin(t) {
+  token = t;
+  const r = await api('/status');
+  if (r.status === 200) { sessionStorage.setItem('dsp_token', t); showApp(); refresh(); return true; }
+  token = ''; return false;
+}
+
+let currentTab = 'ringkasan';
+document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => {
+  currentTab = b.dataset.tab;
+  document.querySelectorAll('nav button').forEach((x) => x.classList.toggle('on', x === b));
+  document.querySelectorAll('section.tab').forEach((s) => s.classList.toggle('on', s.id === `tab-${currentTab}`));
+  refresh();
+}));
+
+async function refresh() {
+  if (!token) return;
+  try {
+    if (currentTab === 'ringkasan') await renderRingkasan();
+    else if (currentTab === 'keys') await renderKeys();
+    else if (currentTab === 'models') await renderModels();
+    $('tokstat').textContent = `auto-refresh 15 dtk · ${new Date().toLocaleTimeString()}`;
+  } catch (e) { toast(`Gagal memuat: ${e.message}`); }
+}
+
+async function renderRingkasan() {
+  const [st, cat] = await Promise.all([api('/status'), api('/admin/models')]);
+  if (st.status !== 200 || cat.status !== 200) throw new Error(`status=${st.status} katalog=${cat.status}`);
+  const s = st.json, c = cat.json;
+  $('ver').textContent = `v${s.version} · uptime ${Math.floor(s.uptimeSec / 3600)}j ${Math.floor((s.uptimeSec % 3600) / 60)}m`;
+  $('bigstats').innerHTML = [
+    [`${s.availableNow}/${s.totalKeys}`, 'key siap / total'],
+    [String(c.summary.ok), 'model ok'], [String(c.summary.partial), 'model partial'],
+    [String(c.summary.exhausted), 'model exhausted'], [String(c.summary.special), 'model special'],
+    [String(c.totalModels), 'model total'],
+  ].map(([n, l]) => `<div><div class="num">${esc(n)}</div><div class="lbl">${esc(l)}</div></div>`).join('');
+  const pct = s.totalKeys ? Math.round((s.availableNow / s.totalKeys) * 100) : 0;
+  $('healthbar').style.width = pct + '%';
+  $('healthbar').style.background = pct > 60 ? 'var(--ok)' : pct > 25 ? 'var(--warn)' : 'var(--bad)';
+  $('healthlabel').textContent = `${s.availableNow} dari ${s.totalKeys} key siap (${pct}%), ${s.modelCooldownCount} cooldown model aktif · katalog ${c.source} @ ${c.asOf}`;
+}
+
+async function renderKeys() {
+  const r = await api('/status'); if (r.status !== 200) throw new Error('GET /status gagal');
+  const filter = $('keyFilter').value;
+  const rows = r.json.keys.filter((k) => !filter || k.status === filter);
+  $('keysBody').innerHTML = rows.map((k) => `<tr>
+    <td><code>${esc(k.key)}</code></td>
+    <td>${badge(k.status, k.status === 'active' ? 'b-ok' : 'b-bad')}</td>
+    <td>${k.cooldownUntil ? fmtIn(new Date(k.cooldownUntil) - Date.now()) : '-'}</td>
+    <td class="muted">${esc(k.cooldownReason || (k.modelCooldowns.length ? `${k.modelCooldowns.length} model cooldown` : ''))}</td>
+    <td>${k.totalRequests}</td><td>${k.totalFailures}</td>
+    <td class="muted" title="${esc(k.lastError || '')}">${esc((k.lastError || '').slice(0, 40))}</td>
+    <td><button class="act" data-reset-key="${esc(k.key)}">Reset</button></td>
+  </tr>`).join('');
+}
+let catalogRows = [];
+async function renderModels() {
+  const r = await api('/admin/models'); if (r.status !== 200) throw new Error('GET /admin/models gagal');
+  catalogRows = r.json.models;
+  const cats = [...new Set(catalogRows.map((m) => m.category))].sort();
+  const sel = $('mCategory'), cur = sel.value;
+  sel.innerHTML = '<option value="">semua kategori</option>' + cats.map((c) => `<option>${esc(c)}</option>`).join('');
+  sel.value = cur;
+  $('mInfo').textContent = `${r.json.filtered}/${r.json.totalModels} model · sumber ${r.json.source}`;
+  filterModels();
+}
+
+function filterModels() {
+  const q = $('mSearch').value.toLowerCase(), cat = $('mCategory').value, st = $('mStatus').value;
+  const rows = catalogRows.filter((m) => (!q || m.id.toLowerCase().includes(q))
+    && (!cat || m.category === cat) && (!st || m.status === st));
+  $('modelsBody').innerHTML = rows.map((m) => `<tr class="click" data-model="${esc(m.id)}">
+    <td><code>${esc(m.id)}</code></td><td><span class="chip">${esc(m.category)}</span></td>
+    <td class="muted">${esc(m.transport)}</td><td>${statusBadge(m.status)}</td>
+    <td>${m.keysBlocked}/${m.keysTotal}</td><td class="muted">${esc(m.recommended || '-')}</td>
+    <td><button class="act" data-curl="${esc(m.id)}" data-transport="${esc(m.transport)}">Salin curl</button></td>
+  </tr>`).join('');
+}
+
+function curlFor(id, transport) {
+  const base = location.origin;
+  const path = transport === 'embeddings' ? '/compatible-mode/v1/embeddings'
+    : transport === 'native-image' ? '/api/v1/services/aigc/text2image/image-synthesis'
+      : '/compatible-mode/v1/chat/completions';
+  const body = transport === 'embeddings' ? { model: id, input: 'halo' }
+    : transport === 'native-image' ? { model: id, input: { prompt: 'pemandangan gunung' } }
+      : { model: id, messages: [{ role: 'user', content: 'Halo' }] };
+  return `curl -sS ${base}${path} -H "Authorization: Bearer $DASHSCOPE_PROXY_TOKEN" -H "Content-Type: application/json" -d '${JSON.stringify(body)}'`;
+}
+
+async function showModelDetail(id) {
+  const r = await api('/admin/models/' + encodeURIComponent(id));
+  const box = $('modelDetail');
+  if (r.status !== 200) { box.style.display = 'block'; box.innerHTML = `<p class="muted">Detail gagal: ${esc(r.status)}</p>`; return; }
+  const d = r.json;
+  box.style.display = 'block';
+  box.innerHTML = `<div class="row"><b><code>${esc(d.id)}</code></b> ${statusBadge(d.verdict)}
+      <span class="chip">${esc(d.category)}</span><span class="chip">${esc(d.transport)}</span>
+      ${d.recommended ? `<span class="badge b-ok">rekomendasi: ${esc(d.recommended)}</span>` : ''}
+      <span class="muted">${d.keysBlocked}/${d.keysTotal} key terblokir</span></div>
+    ${d.notes ? `<p class="muted">${esc(d.notes)}</p>` : ''}
+    ${d.sample && d.sample.length ? `<table><thead><tr><th>Key</th><th>Alasan</th><th>Cooldown sampai</th></tr></thead><tbody>
+      ${d.sample.map((s2) => `<tr><td><code>${esc(s2.key)}</code></td><td class="muted">${esc(s2.reason)}</td>
+        <td>${esc(s2.cooldownUntil)} (${fmtIn(new Date(s2.cooldownUntil) - Date.now())})</td></tr>`).join('')}</tbody></table>` : ''}
+    <div class="row" style="margin-top:10px">
+      <button class="act danger" data-reset-model="${esc(d.id)}">Reset cooldown model ini</button>
+      <span class="muted" id="detailMsg"></span></div>`;
+}
+let probeTimer = null;
+async function startProbe() {
+  const models = $('probeModels').value.split('\n').map((s) => s.trim()).filter(Boolean);
+  if (!models.length) { $('probeMsg').textContent = 'Isi minimal satu model.'; return; }
+  const keys = parseInt($('probeKeys').value, 10) || 3;
+  $('probeMsg').textContent = 'Memulai job probe…';
+  const r = await api('/admin/probe', { method: 'POST', body: { models, keys } });
+  if (r.status !== 202) { $('probeMsg').textContent = `Gagal (${r.status}): ${(r.json && r.json.error && r.json.error.message) || ''}`; return; }
+  const jobId = r.json.jobId;
+  $('probeMsg').textContent = `Job ${jobId} berjalan…`;
+  clearInterval(probeTimer);
+  probeTimer = setInterval(async () => {
+    const p = await api('/admin/probe/' + encodeURIComponent(jobId));
+    if (p.status !== 200) return;
+    renderProbeRows(p.json.results || []);
+    if (p.json.status !== 'running') {
+      clearInterval(probeTimer); probeTimer = null;
+      $('probeMsg').textContent = `Selesai${p.json.error ? ` dengan catatan: ${p.json.error}` : ''}.`;
+    }
+  }, 2000);
+}
+function renderProbeRows(rows) {
+  $('probeBody').innerHTML = rows.map((x) => `<tr>
+    <td><code>${esc(x.model)}</code></td>
+    <td>${badge(x.alive ? 'ya' : 'tidak', x.alive ? 'b-ok' : 'b-bad')}</td>
+    <td>${esc(x.status)}</td><td>${x.keysAlive}</td><td>${x.attempts}</td>
+    <td class="muted">${x.ms} ms</td><td class="muted" title="${esc(x.note)}">${esc(String(x.note).slice(0, 70))}</td>
+  </tr>`).join('');
+}
+
+// Delegasi klik untuk tombol dinamis (reset key/model, salin curl, buka detail).
+document.addEventListener('click', async (ev) => {
+  const rk = ev.target.closest('[data-reset-key]');
+  if (rk) { const r = await api('/admin/reset/key', { method: 'POST', body: { key: rk.dataset.resetKey } });
+    toast(r.status === 200 ? (r.json.message || 'Key direset.') : `Gagal ${r.status}`); refresh(); return; }
+  const rm = ev.target.closest('[data-reset-model]');
+  if (rm) { const r = await api('/admin/reset/model', { method: 'POST', body: { model: rm.dataset.resetModel } });
+    const m = $('detailMsg'); if (m) m.textContent = r.status === 200 ? (r.json.message || 'Model direset.') : `Gagal ${r.status}`; return; }
+  const cu = ev.target.closest('[data-curl]');
+  if (cu) { const txt = curlFor(cu.dataset.curl, cu.dataset.transport);
+    try { await navigator.clipboard.writeText(txt); toast('Perintah curl disalin.'); }
+    catch (e) { window.prompt('Salin curl ini:', txt); } return; }
+  const tr = ev.target.closest('tr[data-model]');
+  if (tr && !ev.target.closest('button')) showModelDetail(tr.dataset.model);
+});
+
+$('loginBtn').addEventListener('click', async () => {
+  const t = $('tokenInput').value.trim();
+  if (!t) { $('loginErr').textContent = 'Token tidak boleh kosong.'; return; }
+  if (!(await tryLogin(t))) $('loginErr').textContent = 'Token ditolak -- periksa PROXY_ACCESS_TOKEN.';
+});
+$('tokenInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('loginBtn').click(); });
+$('logoutBtn').addEventListener('click', () => { sessionStorage.removeItem('dsp_token'); token = ''; showLogin(); });
+$('resetAllBtn').addEventListener('click', async () => {
+  const r = await api('/admin/reset', { method: 'POST' });
+  $('actionMsg').textContent = r.status === 200 ? (r.json.message || 'Reset selesai.') : `Gagal ${r.status}`;
+  refresh();
+});
+$('reloadKeysBtn').addEventListener('click', async () => {
+  const r = await api('/admin/keys/reload', { method: 'POST' });
+  $('actionMsg').textContent = r.status === 200 ? (r.json.message || 'Key dimuat ulang.') : `Gagal ${r.status}`;
+  refresh();
+});
+$('keyFilter').addEventListener('change', renderKeys);
+$('mSearch').addEventListener('input', filterModels);
+$('mCategory').addEventListener('change', filterModels);
+$('mStatus').addEventListener('change', filterModels);
+$('probeRun').addEventListener('click', startProbe);
+
+if (token) { tryLogin(token); } else { showLogin(); }
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

@@ -7,7 +7,8 @@
 // semua key mati (code pool_exhausted), penerusan 4xx klien tanpa rotasi, streaming SSE,
 // stripping header gzip, batas ukuran body, /status (termasuk field §2.7), katalog model
 // GET /admin/models + /admin/models/{id} (P0-2), /admin/reset (global, per-model,
-// per-key), dan penulisan PID file.
+// per-key), P1 (/metrics, /admin/keys/reload, /admin/probe*, dashboard /dashboard),
+// dan penulisan PID file.
 
 const { spawn, spawnSync } = require('child_process');
 const http = require('http');
@@ -162,6 +163,7 @@ async function main() {
       REQUEST_MAX_DURATION_MS: '20000',
       RATE_LIMIT_COOLDOWN_MS: '60000',
       PID_FILE: PIDFILE,
+      PROBE_CHILD_PORT: '9913', // port instance proxy sementara milik job probe (P1 §2.6)
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -400,13 +402,116 @@ async function main() {
     c2 = dsp('reset', '--model', 'm-good');
     check('CLI reset --model tanpa cooldown -> exit 1 + pesan 404', c2.status === 1 && /404/.test(c2.stderr), c2.stderr.slice(0, 200));
     c2 = dsp('keys', 'reload');
-    check('CLI keys reload -> pesan endpoint P1 belum tersedia + exit 1', c2.status === 1 && /belum tersedia/i.test(c2.stderr), c2.stderr.slice(0, 200));
-    c2 = dsp('probe', 'm-good', '--keys', '2');
-    check('CLI probe -> pesan endpoint P1 belum tersedia + exit 1', c2.status === 1 && /belum tersedia/i.test(c2.stderr), c2.stderr.slice(0, 200));
+    check('CLI keys reload (endpoint P1) -> exit 0 + pesan ringkasan',
+      c2.status === 0 && /dimuat ulang/i.test(c2.stdout), (c2.stdout + c2.stderr).slice(0, 200));
+    c2 = await new Promise((resolve) => {
+      // Versi async dari dsp(): probe CLI mem-poll job, dan job itu butuh mock upstream
+      // (jalan di proses test ini) tetap responsif -- spawnSync bakal deadlock.
+      const p = spawn(process.execPath, [DSP, 'probe', 'm-good', 'm-empty-pool', '--keys', '2', '--base-url', BASE, '--token', TOKEN], { encoding: 'utf8' });
+      let so = ''; let se = '';
+      p.stdout.on('data', (d) => { so += d; });
+      p.stderr.on('data', (d) => { se += d; });
+      p.on('exit', (code) => resolve({ status: code, stdout: so, stderr: se }));
+    });
+    check('CLI probe (job async + poll, INTERFACE.md §2.6) -> exit 0 + tabel hasil',
+      c2.status === 0 && /HIDUP: 1\/2/.test(c2.stdout) && /m-good/.test(c2.stdout) && /m-empty-pool/.test(c2.stdout),
+      (c2.stdout + c2.stderr).slice(0, 1200));
     c2 = dsp('probe');
     check('CLI probe tanpa model -> exit 2', c2.status === 2, `exit=${c2.status}`);
     r = await request('/admin/tidak-ada', { token: null });
     check('path /admin/* tak dikenal -> 404 (bukan pass-through)', r.status === 404, `status=${r.status}`);
+
+    // --- P1: GET /metrics (INTERFACE.md §2.5) ---
+    r = await request('/metrics', { token: null });
+    const mx = await r.text().catch(() => '');
+    check('GET /metrics terbuka tanpa token, format teks Prometheus',
+      r.status === 200 && /text\/plain/.test(r.headers.get('content-type') || '')
+        && /# TYPE dsp_proxy_requests_total counter/.test(mx)
+        && /# TYPE dsp_proxy_upstream_latency_ms histogram/.test(mx)
+        && /dsp_proxy_upstream_latency_ms_bucket\{le="\+Inf"\} \d+/.test(mx), mx.slice(0, 160));
+    check('/metrics memuat hitungan request & kegagalan berlabel, tanpa rahasia',
+      /dsp_proxy_requests_total\{model="m-good"\} \d+/.test(mx)
+        && /dsp_proxy_failures_total\{model="m-empty-pool",code="free_tier_exhausted"\} \d+/.test(mx)
+        && /dsp_proxy_keys_loaded 6/.test(mx)
+        && !mx.includes('sk-mock') && !mx.includes(TOKEN), mx.slice(0, 200));
+
+    // --- P1: POST /admin/keys/reload (INTERFACE.md §2.4) ---
+    r = await request('/admin/keys/reload', { method: 'POST', token: null });
+    check('POST /admin/keys/reload tanpa token -> 401', r.status === 401, `status=${r.status}`);
+    const origKeysText = fs.readFileSync(KEY_PATH, 'utf8');
+    fs.appendFileSync(KEY_PATH, 'sk-mock-extra-key-9901\n');
+    r = await request('/admin/keys/reload', { method: 'POST' });
+    j = await r.json().catch(() => ({}));
+    check('reload: key baru di file ditambahkan, yang lama dipertahankan (added=1 kept=6 total=7)',
+      r.status === 200 && j.ok === true && j.added === 1 && j.removed === 0 && j.kept === 6 && j.total === 7, JSON.stringify(j));
+    st = await (await request('/status')).json();
+    const k0002 = st.keys.find((k) => k.key.endsWith('0002'));
+    check('reload: key baru muncul di /status; statistik key lama utuh (tidak reset)',
+      st.totalKeys === 7 && st.keys.some((k) => k.key.endsWith('9901'))
+        && k0002 && k0002.totalRequests >= 1 && k0002.totalFailures >= 1,
+      JSON.stringify({ total: st.totalKeys, req0002: k0002 && k0002.totalRequests }));
+    fs.writeFileSync(KEY_PATH, '\n');
+    r = await request('/admin/keys/reload', { method: 'POST' });
+    j = await r.json().catch(() => ({}));
+    st = await (await request('/status')).json();
+    check('reload file kosong -> 400 bad_request, pool lama tetap utuh',
+      r.status === 400 && j.error.code === 'bad_request' && st.totalKeys === 7, `status=${r.status} total=${st.totalKeys}`);
+    fs.writeFileSync(KEY_PATH, origKeysText);
+    r = await request('/admin/keys/reload', { method: 'POST' });
+    j = await r.json().catch(() => ({}));
+    check('reload kembali ke isi semula (removed=1, total=6)', r.status === 200 && j.removed === 1 && j.total === 6, JSON.stringify(j));
+
+    // --- P1: dashboard satu file (INTERFACE.md §3) ---
+    r = await request('/dashboard', { token: null });
+    const dash = await r.text().catch(() => '');
+    check('GET /dashboard -> 200 HTML login form, tanpa rahasia server',
+      r.status === 200 && /text\/html/.test(r.headers.get('content-type') || '')
+        && dash.includes('id="login"') && dash.includes('sessionStorage')
+        && !dash.includes('sk-mock') && !dash.includes(TOKEN), `${r.status} len=${dash.length}`);
+    r = await request('/dashboard?tab=keys', { token: null });
+    check('GET /dashboard?query tetap melayani dashboard', r.status === 200, `status=${r.status}`);
+    r = await request('/dashboard', { method: 'POST', token: null });
+    check('POST /dashboard -> 405', r.status === 405, `status=${r.status}`);
+
+    // --- P1: probe terkelola (INTERFACE.md §2.6) ---
+    // Child proxy jalan di PROBE_CHILD_PORT dengan subset key 0001+0002:
+    // m-good hidup lewat key 0001; m-empty-pool habis di semua key (FreeTierOnly).
+    await sleep(1500); // beri waktu port child probe CLI sebelumnya benar-benar lepas
+    r = await request('/admin/probe', { method: 'POST', token: null, body: { models: ['m-good'], keys: 1 } });
+    check('POST /admin/probe tanpa token -> 401', r.status === 401, `status=${r.status}`);
+    r = await request('/admin/probe', { method: 'POST', body: { keys: 1 } });
+    j = await r.json().catch(() => ({}));
+    check('POST /admin/probe tanpa models -> 400 bad_request', r.status === 400 && j.error.code === 'bad_request', `status=${r.status}`);
+    r = await request('/admin/probe', { method: 'POST', body: { models: ['m-good', 'm-empty-pool'], keys: 2 } });
+    j = await r.json().catch(() => ({}));
+    check('POST /admin/probe -> 202 + jobId + status running',
+      r.status === 202 && j.status === 'running' && /^probe-[0-9a-f]{4}$/.test(j.jobId), JSON.stringify(j));
+    const jobId = j.jobId;
+    r = await request('/admin/probe', { method: 'POST', body: { models: ['m-good'], keys: 1 } });
+    check('POST /admin/probe kedua saat job masih running -> 409', r.status === 409, `status=${r.status}`);
+    let job = null;
+    for (let i = 0; i < 90; i++) {
+      await sleep(1000);
+      const jr = await request(`/admin/probe/${encodeURIComponent(jobId)}`);
+      job = await jr.json().catch(() => ({}));
+      if (job.status !== 'running') break;
+    }
+    check('job probe selesai (status done)', job && job.status === 'done',
+      JSON.stringify({ status: job && job.status, error: job && job.error }));
+    const rowGood = (job.results || []).find((x) => x.model === 'm-good');
+    const rowDead = (job.results || []).find((x) => x.model === 'm-empty-pool');
+    check('hasil probe: m-good hidup (keysAlive=1, attempts=0)',
+      rowGood && rowGood.alive === true && rowGood.keysAlive === 1 && rowGood.attempts === 0, JSON.stringify(rowGood));
+    check('hasil probe: m-empty-pool mati + catatan pool_exhausted + attempts 2 key',
+      rowDead && rowDead.alive === false && rowDead.attempts === 2 && /pool_exhausted/.test(rowDead.note), JSON.stringify(rowDead));
+    check('job probe membawa metadata models & keysUsed',
+      Array.isArray(job.models) && job.models.length === 2 && job.keysUsed === 2,
+      JSON.stringify({ m: job.models, k: job.keysUsed }));
+    r = await request('/admin/probe/probe-entah', { token: null });
+    check('GET /admin/probe/{id} tanpa token -> 401', r.status === 401, `status=${r.status}`);
+    r = await request('/admin/probe/probe-entah');
+    j = await r.json().catch(() => ({}));
+    check('GET /admin/probe/{id} tak dikenal -> 404 not_found', r.status === 404 && j.error.code === 'not_found', `status=${r.status}`);
 
     // --- pidfile ---
     check('PID file ditulis begitu server listen',

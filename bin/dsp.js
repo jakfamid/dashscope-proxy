@@ -76,9 +76,9 @@ Perintah:
   models                      Katalog: id | kategori | status | blokir
   models <id>                 Detail satu model (= GET /admin/models/{id})
   recommend                   Model berlabel rekomendasi katalog + alasan
-  probe <model...> --keys N   Probe ketersediaan model (butuh endpoint P1)
+  probe <model...> --keys N   Probe kuota model (job async, hasil dipoll)
   reset [--model X|--key X]   Reset semua / satu model / satu key cooldown
-  keys reload                 Muat ulang api-key.txt (butuh endpoint P1)
+  keys reload                 Muat ulang api-key.txt tanpa restart
 
 Flag koneksi: --base-url URL, --token TOKEN, --port N
   (default: http://127.0.0.1:$PORT, PORT dari .env/env atau 8787)
@@ -224,16 +224,37 @@ async function main() {
     if (!models.length) fail('probe butuh minimal satu model, mis.: dsp probe qwen-plus --keys 3', 2);
     const keys = parseInt(flags.keys === true || flags.keys === undefined ? '3' : flags.keys, 10);
     if (!Number.isInteger(keys) || keys < 1) fail('--keys harus bilangan bulat >= 1', 2);
-    const r = await api('POST', '/admin/probe', { models, keysPerModel: keys }, 120000);
-    if (r.status === 404) fail('endpoint /admin/probe belum tersedia di server versi ini (rencana P1)', 1);
-    if (r.status !== 200) fail(`POST /admin/probe gagal (${r.status}): ${apiError(r)}`, 1);
-    const j = r.json || {};
-    if (Array.isArray(j.results)) {
-      console.log(table(['MODEL', 'HIDUP', 'KEY HIDUP', 'PERCOBAAN'], j.results.map((x) => [
-        x.model, x.alive ? 'ya' : 'tidak', x.keysAlive == null ? '?' : String(x.keysAlive), x.attempts == null ? '' : String(x.attempts),
+    const start = await api('POST', '/admin/probe', { models, keys }, 15000);
+    if (start.status === 404) fail('endpoint /admin/probe belum tersedia di server versi ini', 1);
+    if (start.status === 409) fail(`server sibuk: ${(start.json && start.json.error && start.json.error.message) || 'sudah ada job probe berjalan'}`, 1);
+    if (start.status !== 202) fail(`POST /admin/probe gagal (${start.status}): ${apiError(start)}`, 1);
+    const jobId = start.json && start.json.jobId;
+    if (!jobId) fail(`respons 202 tanpa jobId: ${start.text.slice(0, 120)}`, 1);
+    // INTERFACE.md §2.6: POST mengembalikan 202 + jobId; hasil diambil dengan polling
+    // GET /admin/probe/{jobId} sampai status "done" (timeout job dari sisi server 5
+    // menit; dari sisi CLI dibatasi 6 menit supaya selalu lebih panjang).
+    console.log(`Job ${jobId} berjalan (proxy sementara dengan ${keys} key sample) -- menunggu hasil…`);
+    const deadline = Date.now() + 6 * 60 * 1000;
+    let job = null;
+    for (;;) {
+      const r = await api('GET', `/admin/probe/${encodeURIComponent(jobId)}`, undefined, 15000);
+      if (r.status === 404) fail(`job ${jobId} tidak dikenal server`, 1);
+      if (r.status !== 200) fail(`GET /admin/probe/${jobId} gagal (${r.status}): ${apiError(r)}`, 1);
+      job = r.json;
+      if (job.status !== 'running') break;
+      if (Date.now() > deadline) fail(`job ${jobId} tidak selesai dalam 6 menit`, 1);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    if (job.error) console.error(`catatan job: ${job.error}`);
+    const results = Array.isArray(job.results) ? job.results : [];
+    if (results.length) {
+      console.log(table(['MODEL', 'HIDUP', 'KEY HIDUP', 'PERCOBAAN', 'CATATAN'], results.map((x) => [
+        x.model, x.alive ? 'ya' : 'tidak', x.keysAlive == null ? '?' : String(x.keysAlive),
+        x.attempts == null ? '' : String(x.attempts), String(x.note || '').slice(0, 60),
       ])));
+      console.log(`HIDUP: ${results.filter((x) => x.alive).length}/${results.length}`);
     } else {
-      console.log(JSON.stringify(j, null, 2));
+      console.log('Tidak ada hasil (job berakhir tanpa menyelesaikan satu model pun).');
     }
     return;
   }
@@ -256,10 +277,10 @@ async function main() {
   if (cmd === 'keys') {
     if (positional[1] !== 'reload') fail('subperintah keys yang dikenal hanya: keys reload', 2);
     const r = await api('POST', '/admin/keys/reload');
-    if (r.status === 404) fail('endpoint /admin/keys/reload belum tersedia di server versi ini (rencana P1)', 1);
+    if (r.status === 404) fail('endpoint /admin/keys/reload belum tersedia di server versi ini', 1);
     if (r.status !== 200) fail(`POST /admin/keys/reload gagal (${r.status}): ${apiError(r)}`, 1);
     console.log((r.json && r.json.message) || 'Key dimuat ulang.');
-    if (r.json && typeof r.json.totalKeys === 'number') console.log(`Total key sekarang: ${r.json.totalKeys}`);
+    if (r.json && typeof r.json.total === 'number') console.log(`Total key sekarang: ${r.json.total}`);
     return;
   }
 

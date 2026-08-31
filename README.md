@@ -101,6 +101,15 @@ restart` seperti biasa, bukan script ini.
 | `GET /healthz` | tidak perlu | Health check, balas `ok` |
 | `GET /status` | Bearer token | Status tiap key (masked): cooldown, jumlah request/gagal, error terakhir |
 | `POST /admin/reset` | Bearer token | Reset semua cooldown (key & model) -- pakai setelah isi saldo/billing DashScope |
+| `POST /admin/reset/model` | Bearer token | Reset cooldown satu model di semua key (`{"model":"..."}`) |
+| `POST /admin/reset/key` | Bearer token | Reset cooldown satu key, terima bentuk masked (`{"key":"sk-abc...wxyz"}`) |
+| `GET /admin/models` | Bearer token | Katalog model hidup: daftar upstream + metadata kurasi + status per model; filter `q`, `category`, `status` |
+| `GET /admin/models/{id}` | Bearer token | Ketersediaan satu model: verdict, alasan cooldown per key, sample |
+| `POST /admin/keys/reload` | Bearer token | Muat ulang `api-key.txt` tanpa restart; statistik & cooldown key lama dipertahankan |
+| `POST /admin/probe` | Bearer token | Mulai job probe kuota (`{"models":[...],"keys":N}`) -> `202` + `jobId`; hanya satu job aktif (`409` bila masih jalan) |
+| `GET /admin/probe/{jobId}` | Bearer token | Status & hasil job probe (`running`/`done`, baris hasil per model, `error` bila ada) |
+| `GET /metrics` | tidak perlu | Metrik agregat format Prometheus (request/gagal per model & kode alasan, rotasi, latency bucket, jumlah key/cooldown aktif) -- tanpa rahasia |
+| `GET /dashboard` | tidak perlu | Web dashboard satu file (login pakai `PROXY_ACCESS_TOKEN`, token hanya disimpan di `sessionStorage` browser) |
 
 Auth pakai header `Authorization: Bearer <PROXY_ACCESS_TOKEN>`. Kalau
 `PROXY_ACCESS_TOKEN` tidak diset, semua endpoint terbuka tanpa autentikasi
@@ -131,8 +140,19 @@ Batas yang perlu diketahui sebelum memilih model:
 Proposal pengembangan interface sistem ini (admin API, dashboard web, CLI,
 plus rencana afinitas task async & WebSocket realtime) ada di
 **[INTERFACE.md](INTERFACE.md)** — katalog model (§2.1–2.2), reset selektif
-(§2.3–2.7), & CLI (§4, `npm run cli`) sudah diimplementasi; dashboard masih
-usulan.
+(§2.3–2.7), CLI (§4, `npm run cli`), dan seluruh P1 — reload key (§2.4),
+`/metrics` (§2.5), probe terkelola (§2.6), dashboard (§3) — sudah
+diimplementasi; tersisa P2 (afinitas task async & WebSocket realtime).
+
+### Dashboard web
+
+Buka `http://<host>:<PORT>/dashboard`, masukkan `PROXY_ACCESS_TOKEN` di form
+login. Halaman HTML-nya sendiri publik dan tidak mengandung rahasia apa pun —
+semua data ditarik browser dari endpoint admin ber-token, dan token hanya
+disimpan di `sessionStorage` tab tersebut. Tab yang tersedia: Ringkasan
+(kesehatan pool + tombol reset/reload), Keys, Models (katalog + detail cooldown),
+dan Probe (menjalankan job probe kuota tanpa menyentuh terminal). Karena
+dashboard memakai token proxy penuh, hanya publikasikan di network tepercaya.
 
 ## Variabel lingkungan
 
@@ -152,6 +172,8 @@ usulan.
 | `FREE_TIER_EXHAUSTED_COOLDOWN_MS` | `2592000000` (30 hari) | Cooldown model saat kuota trial gratis habis (biasanya permanen sampai isi saldo -- pakai `/admin/reset` setelah itu) |
 | `MODEL_ACCESS_DENIED_COOLDOWN_MS` | `86400000` (24 jam) | Cooldown model saat model tidak diaktifkan untuk akun key tsb |
 | `PID_FILE` | `.dashscope-proxy.pid` | Lokasi file PID yang ditulis saat start, dibaca `stop.sh`/`stop.ps1`/`restart.sh`/`restart.ps1` |
+| `PROBE_CHILD_PORT` | `8794` | Port instance proxy sementara yang dijalankan job `POST /admin/probe` (harus bebas; default dipilih di luar PORT umum) |
+| `PROBE_JOB_TIMEOUT_MS` | `300000` (5 menit) | Batas waktu satu job probe; hasil parsial tetap dilaporkan bila timeout |
 
 ## Keamanan
 

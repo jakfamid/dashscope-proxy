@@ -370,6 +370,11 @@ ketergantungan antar item:
 | **P2-2** | Proxy WebSocket realtime | membuka 24 model, risiko tertinggi | ~200 baris, perlu test WS | — |
 | **P2-3** | Generator katalog otomatis dari `/models` upstream | rendah — kurasi manual masih cukup | satu skrip | P0-2 |
 
+**Status:** P0-1..P0-3 selesai (commit terpisah per tahap); **P1-1..P1-4
+selesai** dalam satu commit P1 (reload key, `/metrics`, probe terkelola via
+`lib/quota-probe.js`, dashboard `public/dashboard.html`) — tabel dipertahankan
+sebagai peta pekerjaan. Tersisa P2.
+
 Saran pembagian commit: satu tahap = satu commit (pola repo ini), masing-masing
 ditutup dengan `npm test` + `npm run test:live`.
 

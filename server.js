@@ -7,6 +7,7 @@ const path = require('path');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 const catalog = require('./lib/model-catalog');
+const quotaProbe = require('./lib/quota-probe');
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const UPSTREAM_HOST = process.env.DASHSCOPE_UPSTREAM_HOST || 'dashscope-intl.aliyuncs.com';
@@ -137,29 +138,46 @@ function classifyFailure(status, bodyText) {
   const code = (tryParseErrorCode(bodyText) || '').toLowerCase();
 
   if (code.includes('freetieronly') || code.includes('allocationquota')) {
-    return { retryable: true, scope: 'model', cooldownMs: FREE_TIER_EXHAUSTED_COOLDOWN_MS, reason: 'kuota trial gratis untuk model ini habis (kemungkinan permanen sampai isi saldo -- reset manual via /admin/reset)' };
+    return { retryable: true, scope: 'model', cooldownMs: FREE_TIER_EXHAUSTED_COOLDOWN_MS, code: 'free_tier_exhausted', reason: 'kuota trial gratis untuk model ini habis (kemungkinan permanen sampai isi saldo -- reset manual via /admin/reset)' };
   }
   if (code.includes('access_denied') || code.includes('accessdenied')) {
-    return { retryable: true, scope: 'model', cooldownMs: MODEL_ACCESS_DENIED_COOLDOWN_MS, reason: 'model tidak diaktifkan/tidak tersedia untuk akun key ini' };
+    return { retryable: true, scope: 'model', cooldownMs: MODEL_ACCESS_DENIED_COOLDOWN_MS, code: 'access_denied', reason: 'model tidak diaktifkan/tidak tersedia untuk akun key ini' };
   }
   if (code.includes('ratequota') || code.includes('throttling')) {
-    return { retryable: true, scope: 'model', cooldownMs: RATE_LIMIT_COOLDOWN_MS, reason: 'rate limit per menit/detik untuk model ini' };
+    return { retryable: true, scope: 'model', cooldownMs: RATE_LIMIT_COOLDOWN_MS, code: 'rate_limit', reason: 'rate limit per menit/detik untuk model ini' };
   }
   if (status === 429) {
-    return { retryable: true, scope: 'model', cooldownMs: RATE_LIMIT_COOLDOWN_MS, reason: 'HTTP 429 (kode error tidak dikenali, asumsikan rate limit sementara)' };
+    return { retryable: true, scope: 'model', cooldownMs: RATE_LIMIT_COOLDOWN_MS, code: 'rate_limit', reason: 'HTTP 429 (kode error tidak dikenali, asumsikan rate limit sementara)' };
   }
   if (status === 401) {
-    return { retryable: true, scope: 'key', cooldownMs: INVALID_KEY_COOLDOWN_MS, reason: 'key ditolak (HTTP 401 -- kemungkinan kredensial tidak valid)' };
+    return { retryable: true, scope: 'key', cooldownMs: INVALID_KEY_COOLDOWN_MS, code: 'invalid_key', reason: 'key ditolak (HTTP 401 -- kemungkinan kredensial tidak valid)' };
   }
   if (status === 403) {
     // 403 tanpa kode error yang cocok di atas -- perlakukan sebagai isu spesifik-model
     // (lebih aman daripada mematikan seluruh key untuk error yang belum pernah diamati).
-    return { retryable: true, scope: 'model', cooldownMs: MODEL_ACCESS_DENIED_COOLDOWN_MS, reason: `HTTP 403 (kode error tidak dikenali: ${code || 'tidak ada'})` };
+    return { retryable: true, scope: 'model', cooldownMs: MODEL_ACCESS_DENIED_COOLDOWN_MS, code: 'access_denied', reason: `HTTP 403 (kode error tidak dikenali: ${code || 'tidak ada'})` };
   }
   if (status >= 500) {
-    return { retryable: true, scope: 'key', cooldownMs: 5000, reason: `error upstream (HTTP ${status})` };
+    return { retryable: true, scope: 'key', cooldownMs: 5000, code: 'upstream_5xx', reason: `error upstream (HTTP ${status})` };
   }
-  return { retryable: false, scope: null, cooldownMs: 0, reason: null };
+  return { retryable: false, scope: null, cooldownMs: 0, code: 'client_error', reason: null };
+}
+
+// ---------------- P1: metrik agregat untuk GET /metrics (INTERFACE.md §2.5) ----------------
+// Dihitung di memori, dirender sebagai text format Prometheus. Label dibatasi pada nama
+// model & kode alasan -- key/rahasia tidak pernah masuk label.
+const metrics = {
+  requestsByModel: {},        // { model: jumlah request proxy yang menyebut model itu }
+  failuresByModelCode: {},    // { "model|code": jumlah } -- code dari classifyFailure/network
+  rotations: 0,               // berapa kali kegagalan memicu rotasi ke key berikutnya
+  latencyCounts: [0, 0, 0],   // non-kumulatif: <=1000ms, <=5000ms, >5000ms (dirender kumulatif)
+};
+function recordUpstreamLatency(ms) {
+  metrics.latencyCounts[ms <= 1000 ? 0 : ms <= 5000 ? 1 : 2] += 1;
+}
+function bumpFailure(model, code) {
+  const k = `${model || 'unknown'}|${code}`;
+  metrics.failuresByModelCode[k] = (metrics.failuresByModelCode[k] || 0) + 1;
 }
 
 // fetch() sudah otomatis membongkar gzip/br saat kita baca resp.arrayBuffer(), tapi header
@@ -235,11 +253,13 @@ function extractModel(bodyBuffer) {
 
 async function handleProxyRequest(req, res, bodyBuffer) {
   const model = extractModel(bodyBuffer);
+  if (model) metrics.requestsByModel[model] = (metrics.requestsByModel[model] || 0) + 1;
   const attempts = pickKeysInOrder(model);
   const log = [];
   const requestStarted = Date.now();
 
-  for (const entry of attempts) {
+  for (let attemptIdx = 0; attemptIdx < attempts.length; attemptIdx += 1) {
+    const entry = attempts[attemptIdx];
     if (Date.now() - requestStarted >= REQUEST_MAX_DURATION_MS) {
       log.push(`berhenti rotasi -- batas waktu total request (${REQUEST_MAX_DURATION_MS}ms) tercapai, sisa key tidak dicoba`);
       break;
@@ -255,6 +275,8 @@ async function handleProxyRequest(req, res, bodyBuffer) {
       entry.lastError = err.message;
       entry.cooldownUntil = Date.now() + 5000;
       entry.cooldownReason = `network/timeout: ${err.message}`;
+      bumpFailure(model, 'network');
+      if (attemptIdx < attempts.length - 1) metrics.rotations += 1;
       log.push(`${entry.masked} -> gagal koneksi (${err.message})`);
       continue;
     }
@@ -268,6 +290,7 @@ async function handleProxyRequest(req, res, bodyBuffer) {
     if (resp.status >= 200 && resp.status < 300) {
       entry.lastError = null;
       const latency = Date.now() - started;
+      recordUpstreamLatency(latency);
       console.log(`[ok] ${req.method} ${req.url} key=${entry.masked} status=${resp.status} ${latency}ms`);
       res.writeHead(resp.status, cleanResponseHeaders(resp.headers));
       try {
@@ -296,6 +319,9 @@ async function handleProxyRequest(req, res, bodyBuffer) {
 
     entry.totalFailures += 1;
     entry.lastError = `HTTP ${resp.status}: ${bodyText.slice(0, 300)}`;
+    bumpFailure(model, cls.code);
+    recordUpstreamLatency(latency);
+    if (attemptIdx < attempts.length - 1) metrics.rotations += 1;
     let appliedCooldownMs = cls.cooldownMs;
     if (cls.scope === 'model' && model) {
       entry.modelCooldowns[model] = { until: Date.now() + cls.cooldownMs, reason: cls.reason };
@@ -592,6 +618,182 @@ async function handleAdminModelDetail(req, res, modelId) {
   });
 }
 
+// ---------------- P1: probe kuota terkelola (INTERFACE.md §2.6) ----------------
+
+const PROBE_CHILD_PORT = parseInt(process.env.PROBE_CHILD_PORT || String(quotaProbe.DEFAULT_PROBE_PORT), 10);
+const PROBE_JOB_TIMEOUT_MS = parseInt(process.env.PROBE_JOB_TIMEOUT_MS || String(5 * 60 * 1000), 10);
+
+// Satu job probe global: hanya satu yang boleh jalan pada satu waktu (409 kalau masih
+// ada yang running). Job menjalankan instance proxy sementara (port lain, subset key,
+// lewat lib/quota-probe.js) sehingga cooldown produksi tidak tercemar; setelah selesai
+// atau timeout child dimatikan dan file sementara dibersihkan. Job terakhir tetap
+// ditahan di memori supaya klien (CLI/dashboard) masih bisa mengambil hasilnya.
+let probeJob = null;
+
+async function handleProbeStart(req, res) {
+  if (probeJob && probeJob.status === 'running') {
+    sendError(res, 409, 'job_already_running', `Job probe "${probeJob.id}" masih berjalan -- tunggu selesai (atau timeout) dulu.`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  let models = body.models;
+  if (typeof models === 'string') models = models.split(',').map((s) => s.trim()).filter(Boolean);
+  if (!Array.isArray(models) || models.length === 0 || models.some((m) => typeof m !== 'string' || !m.trim())) {
+    sendError(res, 400, 'bad_request', 'Field "models" wajib diisi: array id model (atau string CSV).');
+    return;
+  }
+  models = models.map((m) => m.trim());
+  const nKeys = Math.max(1, Math.min(parseInt(body.keys, 10) || 1, keyPool.length));
+
+  const id = `probe-${crypto.randomBytes(2).toString('hex')}`;
+  const logsDir = path.join(__dirname, 'logs');
+  try { fs.mkdirSync(logsDir, { recursive: true }); } catch (e) { /* sudah ada */ }
+  const keysFile = path.join(logsDir, `${id}.keys.txt`);
+  const pidFile = path.join(logsDir, `${id}.pid`);
+  const subset = keyPool.slice(0, nKeys).map((k) => k.key);
+
+  const job = { id, status: 'running', startedAt: Date.now(), models, keysUsed: subset.length, results: [], error: null, child: null, timer: null };
+  probeJob = job;
+  sendJson(res, 202, { ok: true, jobId: id, status: 'running' });
+  console.log(`[probe] job ${id} mulai: ${models.length} model, ${subset.length} key, child port ${PROBE_CHILD_PORT}`);
+
+  job.timer = setTimeout(() => {
+    if (job.status !== 'running') return;
+    job.status = 'done';
+    job.error = `timeout ${Math.round(PROBE_JOB_TIMEOUT_MS / 1000)}s -- hasil parsial (bila ada) tetap dilaporkan`;
+    if (job.child) { try { job.child.kill(); } catch (e) { /* sudah mati */ } }
+  }, PROBE_JOB_TIMEOUT_MS);
+
+  (async () => {
+    const childBase = `http://127.0.0.1:${PROBE_CHILD_PORT}`;
+    try {
+      job.child = quotaProbe.spawnProbeProxy({ root: __dirname, port: PROBE_CHILD_PORT, keys: subset, keysFile, pidFile, token: PROXY_ACCESS_TOKEN });
+      await quotaProbe.waitForHealth(childBase, 15000);
+      job.results = await quotaProbe.probeModels({ baseUrl: childBase, token: PROXY_ACCESS_TOKEN, models, timeoutMs: Math.min(60000, PROBE_JOB_TIMEOUT_MS) });
+      job.status = 'done';
+      console.log(`[probe] job ${id} selesai: ${job.results.filter((r) => r.alive).length}/${job.results.length} model hidup`);
+    } catch (e) {
+      job.status = 'done';
+      job.error = `${e.name || 'Error'}: ${e.message}`;
+      console.error(`[probe] job ${id} gagal: ${job.error}`);
+    } finally {
+      clearTimeout(job.timer);
+      if (job.child) { try { job.child.kill(); } catch (e) { /* sudah mati */ } job.child = null; }
+      quotaProbe.cleanupProbeFiles([keysFile, pidFile]);
+    }
+  })();
+}
+
+function handleProbeStatus(req, res, jobId) {
+  if (!probeJob || probeJob.id !== jobId) {
+    sendError(res, 404, 'not_found', `Job probe "${jobId}" tidak dikenal (hanya job terakhir yang ditahan).`);
+    return;
+  }
+  sendJson(res, 200, {
+    status: probeJob.status,
+    models: probeJob.models,
+    keysUsed: probeJob.keysUsed,
+    startedAt: new Date(probeJob.startedAt).toISOString(),
+    results: probeJob.results,
+    error: probeJob.error,
+  });
+}
+
+// ---------------- P1: GET /metrics (INTERFACE.md §2.5) ----------------
+
+function renderMetrics() {
+  const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, ' ');
+  const lines = [];
+  lines.push('# TYPE dsp_proxy_requests_total counter');
+  for (const [m, n] of Object.entries(metrics.requestsByModel)) {
+    lines.push(`dsp_proxy_requests_total{model="${esc(m)}"} ${n}`);
+  }
+  lines.push('# TYPE dsp_proxy_failures_total counter');
+  for (const [k, n] of Object.entries(metrics.failuresByModelCode)) {
+    const sep = k.indexOf('|');
+    lines.push(`dsp_proxy_failures_total{model="${esc(k.slice(0, sep))}",code="${esc(k.slice(sep + 1))}"} ${n}`);
+  }
+  lines.push('# TYPE dsp_proxy_rotations_total counter');
+  lines.push(`dsp_proxy_rotations_total ${metrics.rotations}`);
+  lines.push('# TYPE dsp_proxy_upstream_latency_ms histogram');
+  const b1 = metrics.latencyCounts[0];
+  const b2 = b1 + metrics.latencyCounts[1];
+  const b3 = b2 + metrics.latencyCounts[2];
+  lines.push(`dsp_proxy_upstream_latency_ms_bucket{le="1000"} ${b1}`);
+  lines.push(`dsp_proxy_upstream_latency_ms_bucket{le="5000"} ${b2}`);
+  lines.push(`dsp_proxy_upstream_latency_ms_bucket{le="+Inf"} ${b3}`);
+  const now = Date.now();
+  lines.push('# TYPE dsp_proxy_key_cooldowns_active gauge');
+  lines.push(`dsp_proxy_key_cooldowns_active ${keyPool.filter((k) => k.cooldownUntil > now).length}`);
+  lines.push('# TYPE dsp_proxy_model_cooldowns_active gauge');
+  lines.push(`dsp_proxy_model_cooldowns_active ${keyPool.reduce((a, k) => a + Object.values(k.modelCooldowns).filter((v) => v.until > now).length, 0)}`);
+  lines.push('# TYPE dsp_proxy_keys_loaded gauge');
+  lines.push(`dsp_proxy_keys_loaded ${keyPool.length}`);
+  return lines.join('\n') + '\n';
+}
+
+// Publik (tanpa token) seperti /healthz: isinya agregat tanpa rahasia -- label hanya
+// nama model & kode alasan, key tidak pernah muncul (INTERFACE.md §2.5).
+function handleMetrics(req, res) {
+  res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+  res.end(renderMetrics());
+}
+
+// ---------------- P1: reload api-key.txt tanpa restart (INTERFACE.md §2.4) ----------------
+
+async function handleKeysReload(req, res) {
+  const newRaw = loadKeys();
+  if (newRaw.length === 0) {
+    sendError(res, 400, 'bad_request', 'Daftar key hasil baca ulang kosong -- reload dibatalkan supaya pool tidak mati.');
+    return;
+  }
+  const oldByKey = new Map(keyPool.map((k) => [k.key, k]));
+  // Key lama dipertahankan beserta statistik & cooldown-nya (dicocokkan lewat key mentah
+  // di memori); key baru masuk state bersih; key yang hilang dari file dibuang.
+  const next = newRaw.map((key) => oldByKey.get(key) || ({
+    key,
+    masked: maskKey(key),
+    cooldownUntil: 0,
+    cooldownReason: null,
+    modelCooldowns: {},
+    totalRequests: 0,
+    totalFailures: 0,
+    lastUsedAt: null,
+    lastError: null,
+  }));
+  const kept = next.filter((e) => oldByKey.has(e.key)).length;
+  // Mutasi in-place: keyPool dideklarasi const (array) dan dirujuk banyak fungsi.
+  keyPool.length = 0;
+  keyPool.push(...next);
+  rrPointer %= keyPool.length;
+  sendJson(res, 200, {
+    ok: true,
+    added: next.length - kept,
+    removed: oldByKey.size - kept,
+    kept,
+    total: keyPool.length,
+    totalKeys: keyPool.length, // alias kompatibilitas dengan keluaran/CLI lama
+    message: `Key dimuat ulang: ${next.length - kept} tambah, ${oldByKey.size - kept} hapus, ${kept} dipertahankan (statistik & cooldown utuh).`,
+  });
+}
+
+// ---------------- P1: dashboard satu file (INTERFACE.md §3) ----------------
+
+const DASHBOARD_FILE = path.join(__dirname, 'public', 'dashboard.html');
+
+// Halaman publik (tidak mengandung rahasia apa pun -- semua data diambil browser dari
+// endpoint admin ber-token). Dibaca per request supaya operator bisa edit tanpa restart.
+function handleDashboard(req, res) {
+  try {
+    const html = fs.readFileSync(DASHBOARD_FILE, 'utf8');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(html);
+  } catch (e) {
+    sendError(res, 404, 'not_found', 'Berkas public/dashboard.html tidak ditemukan.');
+  }
+}
+
 function isAuthorized(req) {
   if (!PROXY_ACCESS_TOKEN) return true;
   const auth = req.headers['authorization'] || '';
@@ -635,6 +837,22 @@ const server = http.createServer(async (req, res) => {
     if (req.url === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('ok');
+      return;
+    }
+
+    // ---- P1: metrik Prometheus (INTERFACE.md §2.5) -- publik, tanpa rahasia ----
+    if (req.url === '/metrics' && req.method === 'GET') {
+      handleMetrics(req, res);
+      return;
+    }
+
+    // ---- P1: dashboard satu file (INTERFACE.md §3) -- halaman publik ----
+    if (req.url === '/dashboard' || req.url === '/dashboard/' || req.url.startsWith('/dashboard?')) {
+      if (req.method !== 'GET') {
+        sendError(res, 405, 'method_not_allowed', 'Gunakan GET untuk /dashboard.');
+        return;
+      }
+      handleDashboard(req, res);
       return;
     }
 
@@ -687,6 +905,33 @@ const server = http.createServer(async (req, res) => {
       }
       if (!modelId) { sendError(res, 404, 'not_found', 'Path tidak dikenal.'); return; }
       await handleAdminModelDetail(req, res, modelId);
+      return;
+    }
+
+    // ---- P1: reload key & probe terkelola (INTERFACE.md §2.4 & §2.6) ----
+    if (pathname === '/admin/keys/reload' && req.method === 'POST') {
+      if (!isAuthorized(req)) { res.writeHead(401).end('Unauthorized'); return; }
+      await handleKeysReload(req, res);
+      return;
+    }
+
+    if (pathname === '/admin/probe' && req.method === 'POST') {
+      if (!isAuthorized(req)) { res.writeHead(401).end('Unauthorized'); return; }
+      await handleProbeStart(req, res);
+      return;
+    }
+
+    if (pathname.startsWith('/admin/probe/') && req.method === 'GET') {
+      if (!isAuthorized(req)) { res.writeHead(401).end('Unauthorized'); return; }
+      let jobId;
+      try {
+        jobId = decodeURIComponent(pathname.slice('/admin/probe/'.length));
+      } catch {
+        sendError(res, 400, 'bad_request', 'Pengkodean URL job id tidak valid.');
+        return;
+      }
+      if (!jobId) { sendError(res, 404, 'not_found', 'Path tidak dikenal.'); return; }
+      handleProbeStatus(req, res, jobId);
       return;
     }
 
@@ -748,6 +993,8 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`Menerima ${signal}, menutup server...`);
+  // Jangan tinggalkan instance proxy sementara milik job probe (P1 §2.6) yatim.
+  if (probeJob && probeJob.child) { try { probeJob.child.kill(); } catch (e) { /* sudah mati */ } }
   removePidFile();
   server.close(() => process.exit(0));
   // Jaga-jaga kalau ada koneksi keep-alive yang bikin server.close() tidak pernah
