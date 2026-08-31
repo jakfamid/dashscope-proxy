@@ -10,7 +10,8 @@
     "restart": "bash restart.sh",
     "test": "node test/proxy-integration.test.js",
     "test:live": "pwsh -NoProfile -File test/live-smoke.ps1",
-    "test:models": "node test/live-model-probe.js"
+    "test:models": "node test/live-model-probe.js",
+    "test:quota": "node test/live-quota-check.js"
   },
   "license": "UNLICENSED",
   "private": true

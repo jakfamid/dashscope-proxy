@@ -106,6 +106,28 @@ Auth pakai header `Authorization: Bearer <PROXY_ACCESS_TOKEN>`. Kalau
 `PROXY_ACCESS_TOKEN` tidak diset, semua endpoint terbuka tanpa autentikasi
 (cocok untuk network privat, proxy akan cetak warning saat start).
 
+## Model
+
+Daftar lengkap 164 model yang terlihat oleh pool key ini, dikategorikan berdasarkan
+fungsinya (teks, reasoning, coding, vision, OCR, omni, ASR/TTS, terjemahan, embedding,
+image generation, model pihak ketiga) plus status kuota hasil tes nyata, ada di
+**[MODELS.md](MODELS.md)**. Daftar mentah kapan pun:
+`GET /compatible-mode/v1/models`.
+
+Batas yang perlu diketahui sebelum memilih model:
+
+- **Proxy ini hanya meneruskan HTTP.** Model berakhiran `-realtime` (24 id: asr/tts/omni/
+  livetranslate/s2s) butuh WebSocket ke `wss://.../api-ws/v1/inference` dan membalas
+  `400 current user api does not support http call` kalau dipanggil lewat HTTP -- jadi
+  tidak bisa dipakai lewat proxy ini.
+- **Task async tidak ikut rotasi key.** Model image async (mis. `wan2.7-image`) dibuat oleh
+  satu key lalu di-poll lewat `GET /api/v1/tasks/<id>`; karena proxy memilih key secara
+  round-robin, poll bisa jatuh ke key lain dan membalas `task_status: UNKNOWN`.
+- Sebagian model butuh parameter khusus: open-weight Qwen3 menolak non-stream tanpa
+  `enable_thinking: false`, `qvq-max` dan omni butuh `stream: true`, TTS/image memakai
+  endpoint native `/api/v1/services/aigc/...`, embedding memakai
+  `/compatible-mode/v1/embeddings`. Detail per kategori ada di MODELS.md.
+
 ## Variabel lingkungan
 
 | Variabel | Default | Keterangan |
