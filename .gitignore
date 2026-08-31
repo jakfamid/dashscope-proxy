@@ -6,3 +6,9 @@ api-key.txt
 .DS_Store
 Thumbs.db
 node_modules/
+
+# Runtime logs
+logs/
+
+# PID file (ditulis server.js, dibaca stop.sh/stop.ps1/restart.sh/restart.ps1)
+*.pid

@@ -70,6 +70,29 @@ Atau jalankan manual tanpa script, set env var langsung:
 PORT=8787 DASHSCOPE_API_KEYS_FILE=./api-key.txt PROXY_ACCESS_TOKEN=<token> node server.js
 ```
 
+### Stop & restart
+
+`server.js` menulis PID-nya sendiri ke file `.dashscope-proxy.pid` di folder ini
+begitu mulai listen (override lokasinya lewat env var `PID_FILE`) -- jadi
+`stop`/`restart` bekerja tidak peduli proxy dijalankan lewat `npm start`,
+`start.sh`, `start.ps1`, atau `node server.js` langsung.
+
+```bash
+./stop.sh         # atau: npm run stop
+./restart.sh      # atau: npm run restart
+```
+
+```powershell
+.\stop.ps1
+.\restart.ps1
+```
+
+`restart` menghentikan proses lama (kalau sedang jalan) lalu menjalankan ulang
+lewat `start.sh`/`start.ps1` -- tetap berjalan di foreground seperti start
+biasa (perlu dijalankan lagi setelah edit `server.js`, tidak ada hot-reload).
+Kalau dijalankan dengan Docker, pakai `docker compose stop` / `docker compose
+restart` seperti biasa, bukan script ini.
+
 ## Endpoint
 
 | Endpoint | Auth | Keterangan |
@@ -100,6 +123,7 @@ Auth pakai header `Authorization: Bearer <PROXY_ACCESS_TOKEN>`. Kalau
 | `INVALID_KEY_COOLDOWN_MS` | `21600000` (6 jam) | Cooldown key saat kredensial ditolak (401) |
 | `FREE_TIER_EXHAUSTED_COOLDOWN_MS` | `2592000000` (30 hari) | Cooldown model saat kuota trial gratis habis (biasanya permanen sampai isi saldo -- pakai `/admin/reset` setelah itu) |
 | `MODEL_ACCESS_DENIED_COOLDOWN_MS` | `86400000` (24 jam) | Cooldown model saat model tidak diaktifkan untuk akun key tsb |
+| `PID_FILE` | `.dashscope-proxy.pid` | Lokasi file PID yang ditulis saat start, dibaca `stop.sh`/`stop.ps1`/`restart.sh`/`restart.ps1` |
 
 ## Keamanan
 

@@ -5,7 +5,12 @@
   "main": "server.js",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
-    "start:native": "bash start.sh"
+    "start:native": "bash start.sh",
+    "stop": "bash stop.sh",
+    "restart": "bash restart.sh",
+    "test": "node test/proxy-integration.test.js",
+    "test:live": "pwsh -NoProfile -File test/live-smoke.ps1",
+    "test:models": "node test/live-model-probe.js"
   },
   "license": "UNLICENSED",
   "private": true

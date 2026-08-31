@@ -11,7 +11,13 @@ if (Test-Path ".env") {
     Get-Content ".env" | ForEach-Object {
         if ($_ -match '^\s*#' -or $_ -match '^\s*$') { return }
         if ($_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
-            [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], "Process")
+            $value = $Matches[2]
+            # Lepas tanda kutip pembungkus, samain perilaku dengan
+            # "node --env-file-if-exists" (dipakai npm start) yang juga melepasnya.
+            if ($value -match '^"(.*)"$' -or $value -match "^'(.*)'$") {
+                $value = $Matches[1]
+            }
+            [Environment]::SetEnvironmentVariable($Matches[1], $value, "Process")
         }
     }
 }

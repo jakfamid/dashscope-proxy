@@ -2,6 +2,9 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const UPSTREAM_HOST = process.env.DASHSCOPE_UPSTREAM_HOST || 'dashscope-intl.aliyuncs.com';
@@ -32,6 +35,10 @@ const MODEL_ACCESS_DENIED_COOLDOWN_MS = parseInt(process.env.MODEL_ACCESS_DENIED
 // lambat tapi valid tetap sempat selesai) -- yang dibatasi cuma jumlah waktu yang dihabiskan
 // pindah dari satu key ke key berikutnya.
 const REQUEST_MAX_DURATION_MS = parseInt(process.env.REQUEST_MAX_DURATION_MS || String(2 * UPSTREAM_TIMEOUT_MS), 10);
+// Ditulis begitu server mulai listen, dibaca oleh stop.sh/stop.ps1/restart.sh/restart.ps1
+// supaya proses bisa dihentikan tanpa peduli cara start-nya (npm start, start.sh,
+// start.ps1, atau "node server.js" langsung).
+const PID_FILE = process.env.PID_FILE || '.dashscope-proxy.pid';
 
 function loadKeys() {
   const fromEnv = (process.env.DASHSCOPE_API_KEYS || '')
@@ -41,7 +48,6 @@ function loadKeys() {
   let fromFile = [];
   if (DASHSCOPE_API_KEYS_FILE) {
     try {
-      const fs = require('fs');
       fromFile = fs
         .readFileSync(DASHSCOPE_API_KEYS_FILE, 'utf8')
         .split('\n')
@@ -105,12 +111,6 @@ function pickKeysInOrder(model) {
   return [...available, ...cooling];
 }
 
-function msUntilNextUtcMidnight() {
-  const now = new Date();
-  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
-  return next.getTime() - now.getTime();
-}
-
 function tryParseErrorCode(bodyText) {
   try {
     const parsed = JSON.parse(bodyText);
@@ -170,6 +170,13 @@ function cleanResponseHeaders(headers) {
   return out;
 }
 
+// Cuma melakukan fetch dan mengembalikan resp + timer -- BELUM membaca body, supaya
+// respons sukses (mis. stream: true / SSE) bisa langsung di-pipe ke klien tanpa
+// ditahan/dibuffer penuh dulu (lihat pipeSuccessBody). Body baru dibaca terpisah oleh
+// pemanggil: untuk respons error dibuffer (perlu dibaca buat klasifikasi), untuk
+// respons sukses di-pipe. Timer HARUS di-clear oleh pemanggil setelah selesai membaca
+// body (bukan di sini), supaya UPSTREAM_TIMEOUT_MS tetap membatasi total waktu
+// fetch + baca body, termasuk saat streaming.
 async function forwardOnce(entry, method, path, headers, bodyBuffer) {
   const url = UPSTREAM_ORIGIN + path;
   const outHeaders = new Headers();
@@ -189,11 +196,25 @@ async function forwardOnce(entry, method, path, headers, bodyBuffer) {
       body: ['GET', 'HEAD'].includes(method) ? undefined : bodyBuffer,
       signal: controller.signal,
     });
-    const buf = Buffer.from(await resp.arrayBuffer());
-    return { status: resp.status, headers: resp.headers, body: buf };
-  } finally {
+    return { resp, timer };
+  } catch (err) {
     clearTimeout(timer);
+    throw err;
   }
+}
+
+// Pipe body respons sukses langsung ke klien tanpa dibuffer penuh -- perlu untuk
+// stream: true (SSE) supaya token mengalir bertahap, bukan menumpuk lalu dikirim
+// sekaligus di akhir (dan berisiko kena UPSTREAM_TIMEOUT_MS untuk respons panjang).
+// Konsekuensinya: begitu fungsi ini dipanggil, header sudah dikirim ke klien, jadi
+// kalau stream gagal di tengah jalan, request TIDAK bisa dirotasi ke key lain lagi --
+// itu trade-off yang melekat pada streaming (lihat handleProxyRequest).
+async function pipeSuccessBody(resp, res) {
+  if (!resp.body) {
+    res.end();
+    return;
+  }
+  await pipeline(Readable.fromWeb(resp.body), res);
 }
 
 function extractModel(bodyBuffer) {
@@ -219,9 +240,9 @@ async function handleProxyRequest(req, res, bodyBuffer) {
     entry.totalRequests += 1;
     entry.lastUsedAt = new Date().toISOString();
     const started = Date.now();
-    let result;
+    let fwd;
     try {
-      result = await forwardOnce(entry, req.method, req.url, req.headers, bodyBuffer);
+      fwd = await forwardOnce(entry, req.method, req.url, req.headers, bodyBuffer);
     } catch (err) {
       entry.totalFailures += 1;
       entry.lastError = err.message;
@@ -231,35 +252,61 @@ async function handleProxyRequest(req, res, bodyBuffer) {
       continue;
     }
 
-    const latency = Date.now() - started;
-    const bodyText = result.body.toString('utf8').slice(0, 2000);
+    const { resp, timer } = fwd;
 
-    if (result.status >= 200 && result.status < 300) {
+    // Sukses: header respons sudah diketahui (fetch() resolve begitu header upstream
+    // tiba, sebelum body selesai) -- pipe body langsung ke klien tanpa dibuffer, supaya
+    // stream: true (SSE) mengalir bertahap. Setelah titik ini rotasi TIDAK mungkin lagi
+    // karena header sudah dikirim ke klien.
+    if (resp.status >= 200 && resp.status < 300) {
       entry.lastError = null;
-      console.log(`[ok] ${req.method} ${req.url} key=${entry.masked} status=${result.status} ${latency}ms`);
-      res.writeHead(result.status, cleanResponseHeaders(result.headers));
-      res.end(result.body);
+      const latency = Date.now() - started;
+      console.log(`[ok] ${req.method} ${req.url} key=${entry.masked} status=${resp.status} ${latency}ms`);
+      res.writeHead(resp.status, cleanResponseHeaders(resp.headers));
+      try {
+        await pipeSuccessBody(resp, res);
+      } finally {
+        clearTimeout(timer);
+      }
       return;
     }
 
-    const cls = classifyFailure(result.status, bodyText);
+    // Error: body upstream untuk error biasanya kecil (JSON) dan HARUS dibaca penuh
+    // dulu supaya classifyFailure() bisa menentukan apakah perlu dirotasi -- belum ada
+    // apa pun yang dikirim ke klien di titik ini, jadi masih aman untuk dicoba key lain.
+    const buf = Buffer.from(await resp.arrayBuffer());
+    clearTimeout(timer);
+    const latency = Date.now() - started;
+    const bodyText = buf.toString('utf8').slice(0, 2000);
+
+    const cls = classifyFailure(resp.status, bodyText);
     if (!cls.retryable) {
-      console.log(`[client-error] ${req.method} ${req.url} key=${entry.masked} status=${result.status} ${latency}ms (tidak rotasi -- kesalahan request, bukan kuota)`);
-      res.writeHead(result.status, cleanResponseHeaders(result.headers));
-      res.end(result.body);
+      console.log(`[client-error] ${req.method} ${req.url} key=${entry.masked} status=${resp.status} ${latency}ms (tidak rotasi -- kesalahan request, bukan kuota)`);
+      res.writeHead(resp.status, cleanResponseHeaders(resp.headers));
+      res.end(buf);
       return;
     }
 
     entry.totalFailures += 1;
-    entry.lastError = `HTTP ${result.status}: ${bodyText.slice(0, 300)}`;
+    entry.lastError = `HTTP ${resp.status}: ${bodyText.slice(0, 300)}`;
+    let appliedCooldownMs = cls.cooldownMs;
     if (cls.scope === 'model' && model) {
       entry.modelCooldowns[model] = { until: Date.now() + cls.cooldownMs, reason: cls.reason };
+    } else if (cls.scope === 'model') {
+      // Model tidak diketahui dari body request (mis. GET tanpa body, atau body bukan
+      // JSON) -- tidak bisa cooldown per-model dengan aman, jadi JANGAN pakai
+      // cls.cooldownMs (bisa sampai 30 hari) untuk cooldown level KEY, karena itu akan
+      // mematikan key untuk SEMUA model gara-gara satu request yang tidak jelas modelnya.
+      // Pakai cooldown pendek sebagai gantinya.
+      appliedCooldownMs = RATE_LIMIT_COOLDOWN_MS;
+      entry.cooldownUntil = Date.now() + appliedCooldownMs;
+      entry.cooldownReason = `${cls.reason} (model tidak diketahui dari request, cooldown key dipersingkat)`;
     } else {
       entry.cooldownUntil = Date.now() + cls.cooldownMs;
       entry.cooldownReason = cls.reason;
     }
-    log.push(`${entry.masked} -> ${cls.reason} [scope=${cls.scope}${model ? `, model=${model}` : ''}], cooldown ${Math.round(cls.cooldownMs / 1000)}s`);
-    console.log(`[rotate] ${req.method} ${req.url} key=${entry.masked} model=${model || '?'} status=${result.status} ${latency}ms reason="${cls.reason}"`);
+    log.push(`${entry.masked} -> ${cls.reason} [scope=${cls.scope}${model ? `, model=${model}` : ''}], cooldown ${Math.round(appliedCooldownMs / 1000)}s`);
+    console.log(`[rotate] ${req.method} ${req.url} key=${entry.masked} model=${model || '?'} status=${resp.status} ${latency}ms reason="${cls.reason}"`);
   }
 
   res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -325,11 +372,18 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
+    let overflowed = false;
     req.on('data', (chunk) => {
+      if (overflowed) return; // sisa body tidak ditumpuk di memori lagi
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
+        overflowed = true;
+        // PAUSE, jangan destroy(): destroy() memutus koneksi SEBELUM respons 413 sempat
+        // terkirim, sehingga klien (undici/axios/n8n) cuma melihat "connection reset" dan
+        // tidak tahu bahwa penyebabnya body terlalu besar. Dengan pause, respons 413 di
+        // bawah (yang memakai Connection: close) tetap flushed dulu, baru socket ditutup.
+        req.pause();
         reject(Object.assign(new Error('Body terlalu besar'), { statusCode: 413 }));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
@@ -368,15 +422,61 @@ const server = http.createServer(async (req, res) => {
     const bodyBuffer = await readBody(req);
     await handleProxyRequest(req, res, bodyBuffer);
   } catch (err) {
+    if (res.headersSent) {
+      console.error(`Error setelah respons mulai dikirim: ${err.message}`);
+      res.destroy();
+      return;
+    }
     const status = err.statusCode || 500;
-    res.writeHead(status, { 'Content-Type': 'application/json' });
+    const headers = { 'Content-Type': 'application/json' };
+    // Body 413: request belum selesai dibaca, jadi socket wajib ditutup setelah respons
+    // diflush (Connection: close) -- kalau tidak, koneksi keep-alive menggantung sisa upload.
+    if (status === 413) headers.Connection = 'close';
+    res.writeHead(status, headers);
     res.end(JSON.stringify({ error: { message: err.message } }));
   }
 });
+
+function writePidFile() {
+  try {
+    fs.writeFileSync(PID_FILE, String(process.pid));
+  } catch (e) {
+    // Gagal tulis pidfile (mis. filesystem read-only di sebagian setup container) tidak
+    // fatal buat proxy itu sendiri -- cuma bikin stop.sh/stop.ps1 tidak bisa otomatis
+    // menemukan proses ini.
+    console.warn(`Tidak bisa menulis PID file ${PID_FILE}: ${e.message}`);
+  }
+}
+
+function removePidFile() {
+  try {
+    if (fs.readFileSync(PID_FILE, 'utf8').trim() === String(process.pid)) {
+      fs.unlinkSync(PID_FILE);
+    }
+  } catch (e) {
+    // Pidfile sudah tidak ada / tidak kebaca -- tidak masalah, tidak ada yang perlu dibersihkan.
+  }
+}
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Menerima ${signal}, menutup server...`);
+  removePidFile();
+  server.close(() => process.exit(0));
+  // Jaga-jaga kalau ada koneksi keep-alive yang bikin server.close() tidak pernah
+  // selesai -- tetap keluar setelah beberapa detik daripada proses menggantung selamanya.
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('exit', removePidFile);
 
 server.listen(PORT, () => {
   console.log(`DashScope proxy jalan di port ${PORT}, ${keyPool.length} API key dimuat, upstream=${UPSTREAM_ORIGIN}`);
   if (!PROXY_ACCESS_TOKEN) {
     console.warn('PROXY_ACCESS_TOKEN tidak diset -- endpoint proxy TERBUKA tanpa autentikasi di dalam network ini.');
   }
+  writePidFile();
 });
