@@ -7,7 +7,12 @@ const PORT = parseInt(process.env.PORT || '8787', 10);
 const UPSTREAM_HOST = process.env.DASHSCOPE_UPSTREAM_HOST || 'dashscope-intl.aliyuncs.com';
 // Override penuh (termasuk skema) dipakai untuk pengujian lokal terhadap mock server http://.
 const UPSTREAM_ORIGIN = process.env.DASHSCOPE_UPSTREAM_ORIGIN || `https://${UPSTREAM_HOST}`;
-const PROXY_ACCESS_TOKEN = process.env.PROXY_ACCESS_TOKEN || '';
+const DASHSCOPE_API_KEYS_FILE = process.env.DASHSCOPE_API_KEYS_FILE || '.\\api-key.txt';
+const PROXY_ACCESS_TOKEN = process.env.PROXY_ACCESS_TOKEN || process.env.DASHSCOPE_PROXY_TOKEN || '';
+// PROXY_ACCESS_TOKEN bisa datang dari env langsung (docker-compose), dari start.sh/start.ps1,
+// atau dari .env via `node --env-file-if-exists=.env` (npm start) yang hanya berisi
+// DASHSCOPE_PROXY_TOKEN -- makanya perlu fallback ke situ, demi konsistensi dengan pemetaan
+// yang sudah dilakukan start.ps1 / start.sh / docker-compose.yaml.
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(25 * 1024 * 1024), 10);
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || '120000', 10);
 const RATE_LIMIT_COOLDOWN_MS = parseInt(process.env.RATE_LIMIT_COOLDOWN_MS || String(60 * 1000), 10);
@@ -34,11 +39,11 @@ function loadKeys() {
     .map((s) => s.trim())
     .filter(Boolean);
   let fromFile = [];
-  if (process.env.DASHSCOPE_API_KEYS_FILE) {
+  if (DASHSCOPE_API_KEYS_FILE) {
     try {
       const fs = require('fs');
       fromFile = fs
-        .readFileSync(process.env.DASHSCOPE_API_KEYS_FILE, 'utf8')
+        .readFileSync(DASHSCOPE_API_KEYS_FILE, 'utf8')
         .split('\n')
         .map((s) => s.trim())
         .filter((s) => s && !s.startsWith('#'));
