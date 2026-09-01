@@ -1,14 +1,22 @@
 # Proposal interface untuk dashscope-proxy
 
-Status: **implementasi bertahap** — §2.1–2.7 (katalog model + reset selektif
-per-model/per-key + field `/status`) & §4 CLI sudah diimplementasi (P0-1 s.d.
-P0-3); dashboard, probe/metrics, dan sisanya masih proposal. Dibuat berdasar
+Status: **P0 & P1 selesai** — §2.1–2.7 (katalog model + reset selektif
+per-model/per-key + field `/status`), §4 CLI (P0-1 s.d. P0-3), serta seluruh
+P1 (§2.4 reload key, §2.5 `/metrics`, §2.6 probe terkelola, §3 dashboard web)
+sudah diimplementasi dan diuji (`npm test`, lihat §7 untuk peta commit per
+tahap); tersisa P2 (afinitas task async & proxy WebSocket realtime) sebagai
+proposal. Dibuat berdasar
 pembacaan `server.js`
 dan hasil survei `MODELS.md` per 31-08-2026. Tujuan: menjadikan proxy ini bisa
 dioperasikan, dipantau, dan dipilih modelnya lewat interface yang konsisten —
 bukan cuma lewat curl manual ke endpoint wildcard.
 
-## 0. Kondisi interface saat ini
+## 0. Kondisi interface saat ini (baseline sebelum P0/P1)
+
+> Tabel & daftar kesenjangan di bawah ini adalah snapshot per 31-08-2026, titik
+> awal yang memotivasi proposal ini — bukan kondisi terkini. Semua kesenjangan
+> di sini (1–4) sudah ditutup oleh P0/P1; lihat §7 untuk buktinya per item.
+> Poin 5 (limitasi protokol) tetap berlaku karena itu ranah P2.
 
 | Endpoint | Auth | Fungsi |
 |---|---|---|
