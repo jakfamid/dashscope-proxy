@@ -93,6 +93,34 @@ biasa (perlu dijalankan lagi setelah edit `server.js`, tidak ada hot-reload).
 Kalau dijalankan dengan Docker, pakai `docker compose stop` / `docker compose
 restart` seperti biasa, bukan script ini.
 
+### Autostart di Windows (Task Scheduler)
+
+Supaya proxy jalan otomatis setiap kali Windows nyala:
+
+```powershell
+.\install-autostart.ps1              # start otomatis saat user login
+.\install-autostart.ps1 -AtStartup   # start otomatis saat boot, sebelum login (jalan sebagai SYSTEM)
+```
+
+Script minta elevasi administrator (UAC) lalu mendaftarkan task
+`DashscopeProxy Autostart` di Task Scheduler yang memanggil `start.ps1`
+lewat launcher VBS kecil (`autostart-launcher.vbs`, dibuat otomatis,
+sudah masuk `.gitignore`) supaya tidak muncul jendela console. Task
+dikonfigurasi tanpa batas waktu eksekusi (default Task Scheduler 3 hari
+akan mematikan server), tetap jalan saat pakai baterai, tidak dobel
+kalau instance sebelumnya masih hidup, dan retry otomatis 3x kalau
+gagal start. Hapus autostart kapan saja:
+
+```powershell
+.\remove-autostart.ps1
+```
+
+Varian default berjalan sebagai user yang menginstal sehingga `stop.ps1`
+tetap bekerja tanpa admin; varian `-AtStartup` berjalan sebagai SYSTEM
+(proxy sudah siap sebelum login, cocok untuk mesin server) --
+konsekuensinya `stop.ps1` harus dijalankan sebagai administrator untuk
+mematikannya.
+
 ## Endpoint
 
 | Endpoint | Auth | Keterangan |
